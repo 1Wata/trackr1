@@ -204,6 +204,6 @@ if __name__ == '__main__':
     import datasets
     # 检查生成的 Parquet 文件
     parquet_dataset = datasets.load_dataset("parquet", data_files=parquet_file_path)
-    print(parquet_dataset['train'][1])  # 打印第一条记录以验证转换结果
+    print(parquet_dataset['train'][0]['answer'])  # 打印第一条记录以验证转换结果
     # 如果你的图像键名不是 "image"，例如是 "image_files"，则这样调用：
     # convert_json_to_parquet_with_datasets(json_file_path, parquet_file_path, image_key="image_files")

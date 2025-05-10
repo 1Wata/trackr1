@@ -17,6 +17,7 @@ import os
 from collections import defaultdict
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Union
+import re # Added for bbox scaling in prompt
 
 import numpy as np
 import torch
@@ -161,28 +162,151 @@ class RLHFDataset(Dataset, ImageProcessMixin):
 
     def __getitem__(self, index):
         example: dict = self.dataset[index]
-        messages = self._build_messages(example)
 
-        if self.image_key in example:
+        # --- Start of BBox Scaling Logic ---
+        original_image_size = None
+        resized_image_size = None
+        scale_x, scale_y = 1.0, 1.0
+
+        if self.image_key in example and example[self.image_key]:
+            # Access image data to determine scaling factors
+            # We assume example[self.image_key] is a list of image data (e.g., dicts with "bytes" or raw bytes)
+            raw_image_data_list = example[self.image_key] # Do not pop yet
+
+            if isinstance(raw_image_data_list, list) and raw_image_data_list:
+
+                first_raw_item = raw_image_data_list[0]
+                temp_pil_img_orig = None
+                if isinstance(first_raw_item, dict) and "bytes" in first_raw_item:
+                    temp_pil_img_orig = Image.open(BytesIO(first_raw_item["bytes"]))
+                elif isinstance(first_raw_item, bytes): # Handle if raw data is just bytes
+                    temp_pil_img_orig = Image.open(BytesIO(first_raw_item))
+                # Add other potential raw formats if necessary
+
+                if temp_pil_img_orig:
+                    original_image_size = (temp_pil_img_orig.width, temp_pil_img_orig.height)
+                    # Process a copy of the first image to get resized dimensions
+                    # self.process_image is defined in ImageProcessMixin
+                    first_processed_pil_img = self.process_image(temp_pil_img_orig.copy())
+                    resized_image_size = (first_processed_pil_img.width, first_processed_pil_img.height)
+
+                    if original_image_size[0] > 0 and original_image_size[1] > 0:
+                        scale_x = resized_image_size[0] / original_image_size[0]
+                        scale_y = resized_image_size[1] / original_image_size[1]
+                    else:
+                        print(f"Warning (idx {index}): Invalid original image dimensions {original_image_size}. Bbox scaling factors set to 1.")
+                        scale_x, scale_y = 1.0, 1.0
+                    
+                    # Store sizes in example if needed elsewhere, though not strictly required by prompt
+                    example["original_image_size"] = original_image_size
+                    example["resized_image_size"] = resized_image_size
+                else:
+                    print(f"Warning (idx {index}): Could not open first image to determine dimensions. Bbox scaling skipped.")
+                    scale_x, scale_y = 1.0, 1.0
+
+
+            else: # No images in the list
+                scale_x, scale_y = 1.0, 1.0
+
+
+            # Apply scaling if factors are not 1.0 (i.e., resize happened and was measurable)
+            if scale_x != 1.0 or scale_y != 1.0:
+                # 1. Scale Ground Truth Bbox (in example[self.answer_key])
+                # Assumes GT bbox is "x1,y1,x2,y2" string
+                if self.answer_key in example and example[self.answer_key] and isinstance(example[self.answer_key], str):
+                    gt_bbox_str = example[self.answer_key]
+
+                    coords_str_list = gt_bbox_str.split(',')
+                    if len(coords_str_list) == 4:
+                        coords_orig = [int(c.strip()) for c in coords_str_list]
+                        x1_orig, y1_orig, x2_orig, y2_orig = coords_orig
+
+                        x1_s = round(x1_orig * scale_x)
+                        y1_s = round(y1_orig * scale_y)
+                        x2_s = round(x2_orig * scale_x)
+                        y2_s = round(y2_orig * scale_y)
+
+                        if resized_image_size and resized_image_size[0] > 0 and resized_image_size[1] > 0:
+                            x1_s = max(0, min(x1_s, resized_image_size[0] - 1))
+                            y1_s = max(0, min(y1_s, resized_image_size[1] - 1))
+                            x2_s = max(0, min(x2_s, resized_image_size[0] - 1))
+                            y2_s = max(0, min(y2_s, resized_image_size[1] - 1))
+                        
+                        if x1_s > x2_s: x1_s, x2_s = x2_s, x1_s # Ensure x1 <= x2
+                        if y1_s > y2_s: y1_s, y2_s = y2_s, y1_s # Ensure y1 <= y2
+                        
+                        example[self.answer_key] = f"{x1_s},{y1_s},{x2_s},{y2_s}"
+                        # else: Malformed GT bbox string, leave as is or log warning
+
+                # 2. Scale Bboxes within the prompt string (example[self.prompt_key])
+                # Assumes bboxes in prompt are like "[x1,y1,x2,y2]"
+                if self.prompt_key in example and example[self.prompt_key] and isinstance(example[self.prompt_key], str):
+                    current_prompt_str = example[self.prompt_key]
+
+                    def scale_prompt_bbox_callback(match_obj):
+
+                        # match_obj.groups() will be (num_str1, num_str2, num_str3, num_str4)
+                        coords_orig_str = match_obj.groups()
+                        coords_orig = [int(c.strip()) for c in coords_orig_str]
+                        
+                        x1_orig, y1_orig, x2_orig, y2_orig = coords_orig
+
+                        x1_s = round(x1_orig * scale_x)
+                        y1_s = round(y1_orig * scale_y)
+                        x2_s = round(x2_orig * scale_x)
+                        y2_s = round(y2_orig * scale_y)
+
+                        if resized_image_size and resized_image_size[0] > 0 and resized_image_size[1] > 0:
+                            x1_s = max(0, min(x1_s, resized_image_size[0] - 1))
+                            y1_s = max(0, min(y1_s, resized_image_size[1] - 1))
+                            x2_s = max(0, min(x2_s, resized_image_size[0] - 1))
+                            y2_s = max(0, min(y2_s, resized_image_size[1] - 1))
+
+                        if x1_s > x2_s: x1_s, x2_s = x2_s, x1_s # Ensure x1 <= x2
+                        if y1_s > y2_s: y1_s, y2_s = y2_s, y1_s # Ensure y1 <= y2
+                        
+                        return f"[{x1_s},{y1_s},{x2_s},{y2_s}]"
+
+                    # Regex to find "[num, num, num, num]" with optional spaces
+                    scaled_prompt_str = re.sub(
+                        r"\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]",
+                        scale_prompt_bbox_callback,
+                        current_prompt_str
+                    )
+                    example[self.prompt_key] = scaled_prompt_str
+        # --- End of BBox Scaling Logic ---
+
+        messages = self._build_messages(example) # Uses example with potentially scaled prompt_key
+
+        # Original logic for multimodal data
+        if self.image_key in example: # Check again as example[self.image_key] might be empty
+            # The prompt variable below will be generated from 'messages' which are based on the
+            # potentially scaled example[self.prompt_key]
             prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            images = [self.process_image(image) for image in example.pop(self.image_key)]
+            
+            # Process all images. example[self.image_key] is popped here.
+            # The first image was already processed (as a copy) to get resized_image_size.
+            # self.process_image will handle each item.
+            images = [self.process_image(img_data) for img_data in example.pop(self.image_key)]
+            
             model_inputs = self.processor(images, [prompt], add_special_tokens=False, return_tensors="pt")
             input_ids = model_inputs.pop("input_ids")[0]
             attention_mask = model_inputs.pop("attention_mask")[0]
-            example["multi_modal_data"] = {"image": images}
+            example["multi_modal_data"] = {"image": images} # 'images' are processed PIL ImageObjects
             example["multi_modal_inputs"] = dict(model_inputs)
-        else:
+        else: # Original logic for text-only data
             prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             model_inputs = self.tokenizer([prompt], add_special_tokens=False, return_tensors="pt")
             input_ids = model_inputs.pop("input_ids")[0]
             attention_mask = model_inputs.pop("attention_mask")[0]
 
+        # The rest of the method remains unchanged
         if self.processor is not None and self.processor.image_processor.__class__.__name__ == "Qwen2VLImageProcessor":
             # qwen2vl mrope
             position_ids = get_rope_index(
                 self.processor,
                 input_ids=input_ids,
-                image_grid_thw=model_inputs.get("image_grid_thw"),
+                image_grid_thw=model_inputs.get("image_grid_thw"), # Uses model_inputs from above
                 attention_mask=attention_mask,
             )  # (3, seq_length)
         else:
@@ -197,6 +321,7 @@ class RLHFDataset(Dataset, ImageProcessMixin):
             left_pad=True,
             truncation=self.truncation,
         )
+        # 'prompt' here is the one generated after messages (which are based on scaled prompt_key)
         raw_prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
         if len(raw_prompt_ids) > self.max_prompt_length:
             if self.truncation == "left":
@@ -204,11 +329,13 @@ class RLHFDataset(Dataset, ImageProcessMixin):
             elif self.truncation == "right":
                 raw_prompt_ids = raw_prompt_ids[: self.max_prompt_length]
             elif self.truncation == "error":
-                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.max_prompt_length}.")
+                # Ensure index is part of the error message for better debugging
+                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} for example index {index} is longer than {self.max_prompt_length}.")
 
         example["input_ids"] = input_ids
         example["attention_mask"] = attention_mask
         example["position_ids"] = position_ids
         example["raw_prompt_ids"] = raw_prompt_ids
-        example["ground_truth"] = example.pop(self.answer_key)
+        # example[self.answer_key] was potentially scaled, so ground_truth will use the scaled version.
+        example["ground_truth"] = example.pop(self.answer_key) 
         return example

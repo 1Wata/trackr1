@@ -481,7 +481,7 @@ if __name__ == "__main__":
     parser.add_argument("--template_frames", type=int, default=2)
     parser.add_argument("--search_frames", type=int, default=1)
     parser.add_argument("--no_crop", default=True, help="是否不裁剪图像，直接使用原始图像路径")
-    parser.add_argument("--normalize_bbox", default=True, help="是否使用归一化的边界框。如果是，坐标将被归一化并乘以1000取整。")
+    parser.add_argument("--normalize_bbox", default=False, help="是否使用归一化的边界框。如果是，坐标将被归一化并乘以1000取整。")
     parser.add_argument("--output_format", type=str, default="json", choices=["hf", "json"], help="输出数据集的格式: 'hf' (Hugging Face Datasets) 或 'json' (JSON)")
     
     # 解析命令行参数
