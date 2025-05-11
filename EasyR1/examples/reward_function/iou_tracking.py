@@ -72,7 +72,7 @@ def calculate_giou(box1, box2):
     return giou
 
 
-def compute_loss(predict_str: str, ground_truth: str, response_length) -> Dict[str, float]:
+def compute_score(predict_str: str, ground_truth: str, response_length) -> Dict[str, float]:
     if not predict_str or not ground_truth:
         return {"overall": 0.0, "giou": 0.0, "format_score": 0.0}  # 修改为0.0
 
