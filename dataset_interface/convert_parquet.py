@@ -209,6 +209,7 @@ if __name__ == '__main__':
     # 检查生成的 Parquet 文件
     parquet_dataset = datasets.load_dataset("parquet", data_files=parquet_file_path)
     print(parquet_dataset['train'][0]['problem'])  # 打印第一条记录以验证转换结果
+    print(parquet_dataset['train'][0]['answer'])
     print(parquet_dataset['train'][0].keys())  # 打印所有键以验证转换结果
     print(len(parquet_dataset['train'][0]['images']))  # 打印图像数据以验证转换结果
     # print(len(parquet_dataset['train'][1]['images']))
