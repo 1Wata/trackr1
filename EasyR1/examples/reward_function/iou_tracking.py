@@ -3,18 +3,45 @@ from typing import Dict
 import json
 
 def check_format(s):
-    pattern = r'^<think>(?:(?!<think>|</think>).)*</think>(?:(?!<think>|</think>|<answer>|</answer>).)*<answer>(?:(?!<answer>|</answer>).)*</answer>$'
-    if re.fullmatch(pattern, s, flags=re.DOTALL):
-        return 1.0
-    else:
+    # Pattern to find <answer> tag and capture its content
+    answer_pattern = r'^<answer>(.*?)</answer>$'
+    match = re.fullmatch(answer_pattern, s, flags=re.DOTALL)
+
+    if not match:
+        return 0.0  # Basic tag format is incorrect
+
+    content = match.group(1).strip()
+    if not content: # Content inside answer tag is empty
+        return 0.0
+
+    try:
+        # Attempt to parse the content as a JSON list
+        bbox_list = json.loads(content)
+        # Check if it's a list and has 4 elements
+        if isinstance(bbox_list, list) and len(bbox_list) == 4:
+            # Further checks on element types (e.g., all numbers) can be added
+            # but the main GIOU calculation part will handle int conversion.
+            return 1.0
+        else:
+            return 0.0  # Parsed, but not a list of 4 elements
+    except json.JSONDecodeError:
+        return 0.0  # Content is not valid JSON
+    except Exception: # Catch any other unexpected error during parsing check
         return 0.0
 
 def check_and_extract(s):
-    pattern = r'^<think>.*</think>.*<answer>(.*?)</answer>$'
+    # Adjusted pattern to extract content from <answer>...</answer> directly
+    # This is for the "not_think" scenario.
+    pattern = r'^<answer>(.*?)</answer>$'
     match = re.fullmatch(pattern, s, flags=re.DOTALL)
     if match:
-        return match.group(1)
+        extracted_content = match.group(1).strip()
+        # Return 0.0 if extracted content is empty, otherwise the content.
+        # This aligns with the expectation that 0.0 from this function means failure.
+        return extracted_content if extracted_content else 0.0
     else:
+        # Pattern did not match (e.g., s was not just <answer>content</answer>)
+        # This case should ideally be caught by check_format if s is predict_str
         return 0.0
 
 
@@ -47,22 +74,42 @@ def calculate_giou(box1, box2):
 
 def track_compute_score_not_think(predict_str: str, ground_truth: str, response_length) -> Dict[str, float]:
     if not predict_str or not ground_truth:
-        return {"overall": -1.0, "giou": 0.0}
+        return {"overall": -1.0, "giou": 0.0, "format_score": 0.0}
 
-    try: 
-        pre_bbox = json.loads(predict_str) # predict_str is like "[10,20,30,40]"
+    format_score = check_format(predict_str)
+
+    # Extract content within <answer> tag if format is correct
+    if format_score == 1.0:
+        answer_content = check_and_extract(predict_str)
+        if answer_content == 0.0: # check_and_extract returns 0.0 on failure
+            return {"overall": -1.0 + (format_score * 0.2), "giou": 0.0, "format_score": format_score} # penalize if extraction fails despite good format
+        predict_str_for_giou = answer_content
+    else:
+        # If format is incorrect, we might still try to parse predict_str directly
+        # or penalize heavily. For now, let's assume direct parsing attempt.
+        # Or, if strict format adherence is required before GIOU, return low score:
+        # return {"overall": format_score * 0.2 - 1.0 * 0.8, "giou": 0.0, "format_score": format_score}
+        predict_str_for_giou = predict_str # Fallback or could be an empty string / error marker
+
+    try:
+        # Attempt to parse the (potentially extracted) predict_str_for_giou
+        pre_bbox = json.loads(predict_str_for_giou) # predict_str_for_giou is like "[10,20,30,40]"
         # ground_truth is like "10,20,30,40"
         gt_coords_str = ground_truth.split(',')
         if len(gt_coords_str) != 4:
             # Handle error if ground_truth is not in "x,y,w,h" format after split
-            return {"overall": -1.0, "giou": 0.0}
+            return {"overall": -1.0 * 0.8 + (format_score * 0.2), "giou": 0.0, "format_score": format_score}
         gt_bbox = [int(c.strip()) for c in gt_coords_str]
         
         if len(pre_bbox) != 4: # Ensure pre_bbox also has 4 coordinates after json.loads
-            return {"overall": -1.0, "giou": 0.0}
+            return {"overall": -1.0 * 0.8 + (format_score * 0.2), "giou": 0.0, "format_score": format_score}
 
     except (json.JSONDecodeError, ValueError, TypeError): # Catch errors from json.loads, int conversion, or split
-        return {"overall": -1.0, "giou": 0.0}
+        # If parsing fails, GIOU part of score is -1.0
+        giou_component = -1.0
+        giou_reward_copy = 0.0 # Or -1.0 depending on how you want to report raw GIOU on parse failure
+        overall_score = (giou_component * 0.8) + (format_score * 0.2)
+        return {"overall": overall_score, "giou": giou_reward_copy, "format_score": format_score}
     
     try:
         giou_reward = calculate_giou(pre_bbox, gt_bbox)
@@ -70,14 +117,23 @@ def track_compute_score_not_think(predict_str: str, ground_truth: str, response_
         giou_reward = -1.0
 
     giou_reward_copy = giou_reward
+    
+    # Apply GIOU reward adjustments
+    adjusted_giou_reward = giou_reward
     if giou_reward > 0 and giou_reward < 0.4:
-        giou_reward = 0.0
+        adjusted_giou_reward = 0.0
     elif giou_reward > 0.75 and giou_reward < 0.95:
-        giou_reward += 0.2
+        adjusted_giou_reward += 0.2
     elif giou_reward > 0.95:
-        giou_reward += 0.5
+        adjusted_giou_reward += 0.5
+    
+    # Ensure adjusted_giou_reward does not exceed a reasonable upper bound if necessary, e.g., 1.5 for GIOU + 0.5
+    # adjusted_giou_reward = min(adjusted_giou_reward, 1.5) # Example cap
+
+    overall_score = (adjusted_giou_reward * 0.8) + (format_score * 0.2)
 
     return {
-        "overall": giou_reward,
-        "giou": giou_reward_copy,
+        "overall": overall_score,
+        "giou": giou_reward_copy, # Original GIOU before adjustment
+        "format_score": format_score,
     }
