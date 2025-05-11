@@ -161,61 +161,57 @@ class RLHFDataset(Dataset, ImageProcessMixin):
         return len(self.dataset)
 
     def __getitem__(self, index):
-        example: dict = self.dataset[index]
+        example: dict = self.dataset[index].copy() # 使用副本以避免修改缓存中的原始数据
 
         # --- Start of BBox Scaling Logic ---
         original_image_size = None
-        resized_image_size = None
+        resized_image_size = None # 将从第一个图像确定
         scale_x, scale_y = 1.0, 1.0
-
+        
+        raw_image_data_list_from_example = None # 用于临时存储原始图像数据
         if self.image_key in example and example[self.image_key]:
-            # Access image data to determine scaling factors
-            # We assume example[self.image_key] is a list of image data (e.g., dicts with "bytes" or raw bytes)
-            raw_image_data_list = example[self.image_key] # Do not pop yet
+            raw_image_data_list_from_example = example[self.image_key]
 
-            if isinstance(raw_image_data_list, list) and raw_image_data_list:
+            if isinstance(raw_image_data_list_from_example, list) and raw_image_data_list_from_example:
+                try:
+                    first_raw_item = raw_image_data_list_from_example[0]
+                    temp_pil_img_orig = None
+                    if isinstance(first_raw_item, dict) and "bytes" in first_raw_item:
+                        temp_pil_img_orig = Image.open(BytesIO(first_raw_item["bytes"]))
+                    elif isinstance(first_raw_item, bytes):
+                        temp_pil_img_orig = Image.open(BytesIO(first_raw_item))
 
-                first_raw_item = raw_image_data_list[0]
-                temp_pil_img_orig = None
-                if isinstance(first_raw_item, dict) and "bytes" in first_raw_item:
-                    temp_pil_img_orig = Image.open(BytesIO(first_raw_item["bytes"]))
-                elif isinstance(first_raw_item, bytes): # Handle if raw data is just bytes
-                    temp_pil_img_orig = Image.open(BytesIO(first_raw_item))
-                # Add other potential raw formats if necessary
+                    if temp_pil_img_orig:
+                        original_image_size = (temp_pil_img_orig.width, temp_pil_img_orig.height)
+                        # 处理第一个图像的副本来获取调整后的大小，仅用于缩放计算
+                        with temp_pil_img_orig.copy() as temp_copy:
+                            first_processed_pil_img_for_size_calc = self.process_image(temp_copy)
+                        resized_image_size = (first_processed_pil_img_for_size_calc.width, first_processed_pil_img_for_size_calc.height)
 
-                if temp_pil_img_orig:
-                    original_image_size = (temp_pil_img_orig.width, temp_pil_img_orig.height)
-                    # Process a copy of the first image to get resized dimensions
-                    # self.process_image is defined in ImageProcessMixin
-                    first_processed_pil_img = self.process_image(temp_pil_img_orig.copy())
-                    resized_image_size = (first_processed_pil_img.width, first_processed_pil_img.height)
-
-                    if original_image_size[0] > 0 and original_image_size[1] > 0:
-                        scale_x = resized_image_size[0] / original_image_size[0]
-                        scale_y = resized_image_size[1] / original_image_size[1]
+                        if original_image_size[0] > 0 and original_image_size[1] > 0:
+                            scale_x = resized_image_size[0] / original_image_size[0]
+                            scale_y = resized_image_size[1] / original_image_size[1]
+                        else:
+                            print(f"Warning (idx {index}): Invalid original image dimensions {original_image_size}. Bbox scaling factors set to 1.")
+                            scale_x, scale_y = 1.0, 1.0
+                        
+                        example["original_image_size"] = original_image_size
+                        example["resized_image_size"] = resized_image_size # 存储目标尺寸
                     else:
-                        print(f"Warning (idx {index}): Invalid original image dimensions {original_image_size}. Bbox scaling factors set to 1.")
+                        print(f"Warning (idx {index}): Could not open first image to determine dimensions. Bbox scaling skipped.")
                         scale_x, scale_y = 1.0, 1.0
-                    
-                    # Store sizes in example if needed elsewhere, though not strictly required by prompt
-                    example["original_image_size"] = original_image_size
-                    example["resized_image_size"] = resized_image_size
-                else:
-                    print(f"Warning (idx {index}): Could not open first image to determine dimensions. Bbox scaling skipped.")
+                except Exception as e:
+                    print(f"Warning (idx {index}): Error getting image dimensions for scaling: {e}. Bbox scaling factors set to 1.0.")
                     scale_x, scale_y = 1.0, 1.0
-
-
-            else: # No images in the list
+            else: # 图像列表为空或格式不正确
                 scale_x, scale_y = 1.0, 1.0
-
-
-            # Apply scaling if factors are not 1.0 (i.e., resize happened and was measurable)
-            if scale_x != 1.0 or scale_y != 1.0:
-                # 1. Scale Ground Truth Bbox (in example[self.answer_key])
-                # Assumes GT bbox is "x1,y1,x2,y2" string
-                if self.answer_key in example and example[self.answer_key] and isinstance(example[self.answer_key], str):
-                    gt_bbox_str = example[self.answer_key]
-
+        
+        # 如果计算出的缩放因子不是1.0，则应用缩放
+        if scale_x != 1.0 or scale_y != 1.0:
+            # 1. 缩放 Ground Truth Bbox (在 example[self.answer_key] 中)
+            if self.answer_key in example and example[self.answer_key] and isinstance(example[self.answer_key], str):
+                gt_bbox_str = example[self.answer_key]
+                try:
                     coords_str_list = gt_bbox_str.split(',')
                     if len(coords_str_list) == 4:
                         coords_orig = [int(c.strip()) for c in coords_str_list]
@@ -232,23 +228,20 @@ class RLHFDataset(Dataset, ImageProcessMixin):
                             x2_s = max(0, min(x2_s, resized_image_size[0] - 1))
                             y2_s = max(0, min(y2_s, resized_image_size[1] - 1))
                         
-                        if x1_s > x2_s: x1_s, x2_s = x2_s, x1_s # Ensure x1 <= x2
-                        if y1_s > y2_s: y1_s, y2_s = y2_s, y1_s # Ensure y1 <= y2
+                        if x1_s > x2_s: x1_s, x2_s = x2_s, x1_s
+                        if y1_s > y2_s: y1_s, y2_s = y2_s, y1_s
                         
                         example[self.answer_key] = f"{x1_s},{y1_s},{x2_s},{y2_s}"
-                        # else: Malformed GT bbox string, leave as is or log warning
+                except Exception as e:
+                    print(f"Warning (idx {index}): Error scaling GT bbox '{gt_bbox_str}': {e}. Left unscaled.")
 
-                # 2. Scale Bboxes within the prompt string (example[self.prompt_key])
-                # Assumes bboxes in prompt are like "[x1,y1,x2,y2]"
-                if self.prompt_key in example and example[self.prompt_key] and isinstance(example[self.prompt_key], str):
-                    current_prompt_str = example[self.prompt_key]
-
-                    def scale_prompt_bbox_callback(match_obj):
-
-                        # match_obj.groups() will be (num_str1, num_str2, num_str3, num_str4)
+            # 2. 缩放提示字符串中的 Bboxes (在 example[self.prompt_key] 中)
+            if self.prompt_key in example and example[self.prompt_key] and isinstance(example[self.prompt_key], str):
+                current_prompt_str = example[self.prompt_key]
+                def scale_prompt_bbox_callback(match_obj):
+                    try:
                         coords_orig_str = match_obj.groups()
                         coords_orig = [int(c.strip()) for c in coords_orig_str]
-                        
                         x1_orig, y1_orig, x2_orig, y2_orig = coords_orig
 
                         x1_s = round(x1_orig * scale_x)
@@ -262,55 +255,70 @@ class RLHFDataset(Dataset, ImageProcessMixin):
                             x2_s = max(0, min(x2_s, resized_image_size[0] - 1))
                             y2_s = max(0, min(y2_s, resized_image_size[1] - 1))
 
-                        if x1_s > x2_s: x1_s, x2_s = x2_s, x1_s # Ensure x1 <= x2
-                        if y1_s > y2_s: y1_s, y2_s = y2_s, y1_s # Ensure y1 <= y2
+                        if x1_s > x2_s: x1_s, x2_s = x2_s, x1_s
+                        if y1_s > y2_s: y1_s, y2_s = y2_s, y1_s
                         
                         return f"[{x1_s},{y1_s},{x2_s},{y2_s}]"
+                    except Exception: # 如果特定bbox解析或缩放失败，返回原始匹配
+                        return match_obj.group(0) 
 
-                    # Regex to find "[num, num, num, num]" with optional spaces
-                    scaled_prompt_str = re.sub(
-                        r"\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]",
-                        scale_prompt_bbox_callback,
-                        current_prompt_str
-                    )
-                    example[self.prompt_key] = scaled_prompt_str
+                scaled_prompt_str = re.sub(
+                    r"\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]",
+                    scale_prompt_bbox_callback,
+                    current_prompt_str
+                )
+                example[self.prompt_key] = scaled_prompt_str
         # --- End of BBox Scaling Logic ---
 
-        messages = self._build_messages(example) # Uses example with potentially scaled prompt_key
+        # `example` 现在包含可能已缩放的 prompt_key 和 answer_key
+        # `_build_messages` 将使用 (已缩放的) `example[self.prompt_key]` 并应用 Jinja 模板
+        messages = self._build_messages(example) 
 
-        # Original logic for multimodal data
-        if self.image_key in example: # Check again as example[self.image_key] might be empty
-            # The prompt variable below will be generated from 'messages' which are based on the
-            # potentially scaled example[self.prompt_key]
-            prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            
-            # Process all images. example[self.image_key] is popped here.
-            # The first image was already processed (as a copy) to get resized_image_size.
-            # self.process_image will handle each item.
-            images = [self.process_image(img_data) for img_data in example.pop(self.image_key)]
-            
-            model_inputs = self.processor(images, [prompt], add_special_tokens=False, return_tensors="pt")
-            input_ids = model_inputs.pop("input_ids")[0]
-            attention_mask = model_inputs.pop("attention_mask")[0]
-            example["multi_modal_data"] = {"image": images} # 'images' are processed PIL ImageObjects
-            example["multi_modal_inputs"] = dict(model_inputs)
-        else: # Original logic for text-only data
-            prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            model_inputs = self.tokenizer([prompt], add_special_tokens=False, return_tensors="pt")
-            input_ids = model_inputs.pop("input_ids")[0]
-            attention_mask = model_inputs.pop("attention_mask")[0]
+        final_model_prompt_str: str # 这是最终用于tokenizer/processor的字符串
+        model_inputs_for_rope: Dict[str, Any] = {} # 用于 Qwen2VL 的额外输入
 
-        # The rest of the method remains unchanged
+        if self.processor is not None and raw_image_data_list_from_example: # 多模态路径
+            processed_pil_images = [self.process_image(img_data) for img_data in raw_image_data_list_from_example]
+            
+            final_model_prompt_str = self.processor.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False
+            )
+            
+            temp_model_inputs = self.processor(
+                images=processed_pil_images, 
+                text=[final_model_prompt_str], # Processor 通常期望文本列表
+                add_special_tokens=False, # 通常为 False，具体取决于 processor
+                return_tensors="pt"
+            )
+            input_ids = temp_model_inputs.pop("input_ids")[0]
+            attention_mask = temp_model_inputs.pop("attention_mask")[0]
+            
+            example["multi_modal_data"] = {"image": processed_pil_images}
+            model_inputs_for_rope = dict(temp_model_inputs)
+            example["multi_modal_inputs"] = model_inputs_for_rope
+        else: # 纯文本路径
+            final_model_prompt_str = self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False
+            )
+            text_only_inputs = self.tokenizer(
+                [final_model_prompt_str], # Tokenizer 也期望列表
+                add_special_tokens=False,
+                return_tensors="pt"
+            )
+            input_ids = text_only_inputs.pop("input_ids")[0]
+            attention_mask = text_only_inputs.pop("attention_mask")[0]
+            # model_inputs_for_rope 在纯文本模式下为空
+
+        # 后续处理：position_ids, 截断等
         if self.processor is not None and self.processor.image_processor.__class__.__name__ == "Qwen2VLImageProcessor":
-            # qwen2vl mrope
             position_ids = get_rope_index(
                 self.processor,
                 input_ids=input_ids,
-                image_grid_thw=model_inputs.get("image_grid_thw"), # Uses model_inputs from above
+                image_grid_thw=model_inputs_for_rope.get("image_grid_thw"),
                 attention_mask=attention_mask,
-            )  # (3, seq_length)
+            )
         else:
-            position_ids = torch.clip(attention_mask.cumsum(dim=0) - 1, min=0, max=None)  # (seq_length,)
+            position_ids = torch.clip(attention_mask.cumsum(dim=0) - 1, min=0, max=None)
 
         input_ids, attention_mask, position_ids = VF.postprocess_data(
             input_ids=input_ids,
@@ -321,21 +329,27 @@ class RLHFDataset(Dataset, ImageProcessMixin):
             left_pad=True,
             truncation=self.truncation,
         )
-        # 'prompt' here is the one generated after messages (which are based on scaled prompt_key)
-        raw_prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        
+        raw_prompt_ids = self.tokenizer.encode(final_model_prompt_str, add_special_tokens=False)
         if len(raw_prompt_ids) > self.max_prompt_length:
             if self.truncation == "left":
                 raw_prompt_ids = raw_prompt_ids[-self.max_prompt_length :]
             elif self.truncation == "right":
                 raw_prompt_ids = raw_prompt_ids[: self.max_prompt_length]
             elif self.truncation == "error":
-                # Ensure index is part of the error message for better debugging
                 raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} for example index {index} is longer than {self.max_prompt_length}.")
 
         example["input_ids"] = input_ids
         example["attention_mask"] = attention_mask
         example["position_ids"] = position_ids
         example["raw_prompt_ids"] = raw_prompt_ids
-        # example[self.answer_key] was potentially scaled, so ground_truth will use the scaled version.
-        example["ground_truth"] = example.pop(self.answer_key) 
+        
+        example.pop(self.image_key, None) # 清理不再需要的原始图像数据键
+
+        if self.answer_key in example:
+            example["ground_truth"] = example.pop(self.answer_key) # answer_key 的值已被缩放
+        else:
+            example["ground_truth"] = "" 
+            # print(f"Warning (idx {index}): '{self.answer_key}' not found in example after processing. Setting ground_truth to empty string.")
+
         return example
