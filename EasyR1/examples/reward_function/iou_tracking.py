@@ -72,9 +72,9 @@ def calculate_giou(box1, box2):
     return giou
 
 
-def track_compute_score_not_think(predict_str: str, ground_truth: str, response_length) -> Dict[str, float]:
+def compute_loss(predict_str: str, ground_truth: str, response_length) -> Dict[str, float]:
     if not predict_str or not ground_truth:
-        return {"overall": -1.0, "giou": 0.0, "format_score": 0.0}
+        return {"overall": 0.0, "giou": 0.0, "format_score": 0.0}  # 修改为0.0
 
     format_score = check_format(predict_str)
 
@@ -82,39 +82,35 @@ def track_compute_score_not_think(predict_str: str, ground_truth: str, response_
     if format_score == 1.0:
         answer_content = check_and_extract(predict_str)
         if answer_content == 0.0: # check_and_extract returns 0.0 on failure
-            return {"overall": -1.0 + (format_score * 0.2), "giou": 0.0, "format_score": format_score} # penalize if extraction fails despite good format
+            return {"overall": 0.0 + (format_score * 0.2), "giou": 0.0, "format_score": format_score}  # 修改为0.0
         predict_str_for_giou = answer_content
     else:
-        # If format is incorrect, we might still try to parse predict_str directly
-        # or penalize heavily. For now, let's assume direct parsing attempt.
-        # Or, if strict format adherence is required before GIOU, return low score:
-        # return {"overall": format_score * 0.2 - 1.0 * 0.8, "giou": 0.0, "format_score": format_score}
-        predict_str_for_giou = predict_str # Fallback or could be an empty string / error marker
+        predict_str_for_giou = predict_str
 
     try:
         # Attempt to parse the (potentially extracted) predict_str_for_giou
-        pre_bbox = json.loads(predict_str_for_giou) # predict_str_for_giou is like "[10,20,30,40]"
+        pre_bbox = json.loads(predict_str_for_giou)
         # ground_truth is like "10,20,30,40"
         gt_coords_str = ground_truth.split(',')
         if len(gt_coords_str) != 4:
             # Handle error if ground_truth is not in "x,y,w,h" format after split
-            return {"overall": -1.0 * 0.8 + (format_score * 0.2), "giou": 0.0, "format_score": format_score}
+            return {"overall": 0.0 * 0.8 + (format_score * 0.2), "giou": 0.0, "format_score": format_score}  # 修改为0.0
         gt_bbox = [int(c.strip()) for c in gt_coords_str]
         
         if len(pre_bbox) != 4: # Ensure pre_bbox also has 4 coordinates after json.loads
-            return {"overall": -1.0 * 0.8 + (format_score * 0.2), "giou": 0.0, "format_score": format_score}
+            return {"overall": 0.0 * 0.8 + (format_score * 0.2), "giou": 0.0, "format_score": format_score}  # 修改为0.0
 
-    except (json.JSONDecodeError, ValueError, TypeError): # Catch errors from json.loads, int conversion, or split
-        # If parsing fails, GIOU part of score is -1.0
-        giou_component = -1.0
-        giou_reward_copy = 0.0 # Or -1.0 depending on how you want to report raw GIOU on parse failure
-        overall_score = (giou_component * 0.8) + (format_score * 0.2)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        # If parsing fails, GIOU part of score is 0.0 (修改为0.0)
+        giou_component = 0.0
+        giou_reward_copy = 0.0
+        overall_score = max(0.0, (giou_component * 0.8) + (format_score * 0.2))
         return {"overall": overall_score, "giou": giou_reward_copy, "format_score": format_score}
     
     try:
         giou_reward = calculate_giou(pre_bbox, gt_bbox)
     except:
-        giou_reward = -1.0
+        giou_reward = 0.0  # 修改为0.0
 
     giou_reward_copy = giou_reward
     
@@ -127,13 +123,12 @@ def track_compute_score_not_think(predict_str: str, ground_truth: str, response_
     elif giou_reward > 0.95:
         adjusted_giou_reward += 0.5
     
-    # Ensure adjusted_giou_reward does not exceed a reasonable upper bound if necessary, e.g., 1.5 for GIOU + 0.5
-    # adjusted_giou_reward = min(adjusted_giou_reward, 1.5) # Example cap
-
     overall_score = (adjusted_giou_reward * 0.8) + (format_score * 0.2)
+    # 确保overall_score不为负值
+    overall_score = max(0.0, overall_score)
 
     return {
         "overall": overall_score,
-        "giou": giou_reward_copy, # Original GIOU before adjustment
+        "giou": giou_reward_copy,
         "format_score": format_score,
     }
