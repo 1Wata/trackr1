@@ -549,7 +549,7 @@ def main():
     args = parser.parse_args()
 
     if args.gap_list is None:
-        args.gap_list = [1, 5] 
+        args.gap_list = [1, 10] 
     logger.info(f"Using gap_list: {args.gap_list}")
 
     os.makedirs(args.output_dir, exist_ok=True)
