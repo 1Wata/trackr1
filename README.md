@@ -74,3 +74,16 @@ python make_rft_dataset.py --samples_per_epoch 40000 --output_dir path/to/save/j
 开始训练，首先要下载 Qwen2.5VL-3B 模型，使用 EasyR1/examples/config.yaml 脚本即可训练
 
  
+
+
+
+## Step4. 评估：
+
+# 首先运行推理脚本
+```
+python rft_tracking_inference.py --model_path /path/to/model --dataset_name OTB_lang --output_dir result_dir
+```
+# 然后运行 metric 计算脚本
+```
+python analysis_results.py result_dir/OTB_lang OTB_lang
+```
