@@ -97,22 +97,26 @@ def transform_row(original_row: dict, input_image_key: str, output_image_key_nam
             
     final_row['answer'] = processed_answer
 
-    # 2. 从 'prompt' 字段的 'content' 中提取文本作为新的 'problem'
-    # 原始的 'problem' 字段将被忽略
-    problem_text_parts = []
+    # 2. 从 'prompt' 字段的 'content' 中提取文本和图像占位符作为新的 'problem'
+    problem_parts = []
     prompt_data = original_row.get('prompt')
     if isinstance(prompt_data, list) and len(prompt_data) > 0:
-        # 假设我们关心的是 prompt 列表中的第一个元素的 content
         first_prompt_item = prompt_data[0]
         if isinstance(first_prompt_item, dict):
             content_list = first_prompt_item.get('content')
             if isinstance(content_list, list):
                 for item in content_list:
-                    # 提取 'text' 键的值，如果存在且不为 None
-                    if isinstance(item, dict) and 'text' in item and item['text'] is not None:
-                        problem_text_parts.append(str(item['text']).strip())
+                    if isinstance(item, dict):
+                        item_type = item.get('type')
+                        if item_type == 'image':
+                            problem_parts.append('<image>')
+                        # 修改此处的条件：如果不是图像类型，则检查 'text' 键是否存在且有内容
+                        elif 'text' in item and item['text'] is not None:
+                            text_content = str(item['text']).strip()
+                            if text_content:  # 确保添加的不是空字符串
+                                problem_parts.append(text_content)
     
-    final_row['problem'] = "\n".join(problem_text_parts) # 将所有文本部分用换行符连接
+    final_row['problem'] = "\n".join(problem_parts) # 将所有部分用换行符连接
 
     # 3. 处理图像数据
     image_byte_list = []
@@ -204,6 +208,9 @@ if __name__ == '__main__':
     import datasets
     # 检查生成的 Parquet 文件
     parquet_dataset = datasets.load_dataset("parquet", data_files=parquet_file_path)
-    print(parquet_dataset['train'][0]['answer'])  # 打印第一条记录以验证转换结果
+    print(parquet_dataset['train'][0]['problem'])  # 打印第一条记录以验证转换结果
+    print(parquet_dataset['train'][0].keys())  # 打印所有键以验证转换结果
+    print(len(parquet_dataset['train'][0]['images']))  # 打印图像数据以验证转换结果
+    # print(len(parquet_dataset['train'][1]['images']))
     # 如果你的图像键名不是 "image"，例如是 "image_files"，则这样调用：
     # convert_json_to_parquet_with_datasets(json_file_path, parquet_file_path, image_key="image_files")
