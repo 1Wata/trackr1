@@ -72,7 +72,7 @@ def calculate_giou(box1, box2):
     return giou
 
 
-def compute_score(predict_str: str, ground_truth: str, response_length) -> Dict[str, float]:
+def compute_score(predict_str: str, ground_truth: str, format_weight: float = 0.1) -> Dict[str, float]:
     if not predict_str or not ground_truth:
         return {"overall": 0.0, "giou": 0.0, "format_score": 0.0}  # 修改为0.0
 
@@ -82,7 +82,7 @@ def compute_score(predict_str: str, ground_truth: str, response_length) -> Dict[
     if format_score == 1.0:
         answer_content = check_and_extract(predict_str)
         if answer_content == 0.0: # check_and_extract returns 0.0 on failure
-            return {"overall": 0.0 + (format_score * 0.2), "giou": 0.0, "format_score": format_score}  # 修改为0.0
+            return {"overall": 0.0 + (format_score * format_weight), "giou": 0.0, "format_score": format_score}  # 使用format_weight
         predict_str_for_giou = answer_content
     else:
         predict_str_for_giou = predict_str
@@ -94,17 +94,17 @@ def compute_score(predict_str: str, ground_truth: str, response_length) -> Dict[
         gt_coords_str = ground_truth.split(',')
         if len(gt_coords_str) != 4:
             # Handle error if ground_truth is not in "x,y,w,h" format after split
-            return {"overall": 0.0 * 0.8 + (format_score * 0.2), "giou": 0.0, "format_score": format_score}  # 修改为0.0
+            return {"overall": 0.0 * (1-format_weight) + (format_score * format_weight), "giou": 0.0, "format_score": format_score}  # 使用format_weight
         gt_bbox = [int(c.strip()) for c in gt_coords_str]
         
         if len(pre_bbox) != 4: # Ensure pre_bbox also has 4 coordinates after json.loads
-            return {"overall": 0.0 * 0.8 + (format_score * 0.2), "giou": 0.0, "format_score": format_score}  # 修改为0.0
+            return {"overall": 0.0 * (1-format_weight) + (format_score * format_weight), "giou": 0.0, "format_score": format_score}  # 使用format_weight
 
     except (json.JSONDecodeError, ValueError, TypeError):
         # If parsing fails, GIOU part of score is 0.0 (修改为0.0)
         giou_component = 0.0
         giou_reward_copy = 0.0
-        overall_score = max(0.0, (giou_component * 0.8) + (format_score * 0.2))
+        overall_score = max(0.0, (giou_component * (1-format_weight)) + (format_score * format_weight))  # 使用format_weight
         return {"overall": overall_score, "giou": giou_reward_copy, "format_score": format_score}
     
     try:
@@ -123,7 +123,7 @@ def compute_score(predict_str: str, ground_truth: str, response_length) -> Dict[
     elif giou_reward > 0.95:
         adjusted_giou_reward += 0.5
     
-    overall_score = (adjusted_giou_reward * 0.8) + (format_score * 0.2)
+    overall_score = (adjusted_giou_reward * (1-format_weight)) + (format_score * format_weight)  # 使用format_weight
     # 确保overall_score不为负值
     overall_score = max(0.0, overall_score)
 
