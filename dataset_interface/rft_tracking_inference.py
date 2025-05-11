@@ -1,0 +1,1249 @@
+import os
+import re
+import json
+import argparse
+import logging
+# import time # Not used
+import torch
+# import numpy as np # Not used
+from PIL import Image, ImageDraw, ImageFile
+from tqdm import tqdm
+# import matplotlib.pyplot as plt # Not used
+from transformers import AutoProcessor, GenerationConfig
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer
+# sys.path.append( # Assuming evaluation.datasets is accessible or part of EasyR1 structure
+#     os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'rft/src/virft/src'))
+# )
+
+# If evaluation.datasets is part of a different structure, adjust path or ensure PYTHONPATH is set
+# For now, assuming it's findable. If it's part of EasyR1, it might be:
+# from EasyR1.evaluation.datasets import get_dataset, SequenceList
+# Or if this script is intended to be run from within dataset_interface:
+from evaluation.datasets import get_dataset, SequenceList
+
+
+import functools
+import multiprocessing as mp
+from multiprocessing import Pool
+import math
+from typing import List, Optional, Tuple
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True # Helpful for some datasets
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Constants from EasyR1/verl/utils/dataset.py (or similar if they were args)
+# These will now come from args: smart_resize_min_pixels, smart_resize_max_pixels
+# DEFAULT_FACTOR = 28 # No longer used
+DEFAULT_MIN_PIXELS = 3136  # Example, should match training if possible
+DEFAULT_MAX_PIXELS = 102400 # Example, should match training if possible
+
+
+# --- Tracking System Prompt (remains the same) ---
+def get_tracking_system_prompt(use_thinking=False):
+    """获取追踪任务的系统提示"""
+    base_prompt = (
+        "You are a professional visual object tracking assistant. Your task is to track a specified target object. "
+        "The user will provide template frames showing the target object. "
+        "First, identify the target in the template frames. Then, locate the target's position in the following search frames."
+    )
+    
+    if use_thinking: 
+        return base_prompt + (
+            "You should first think about how to locate the target by analyzing visual features, then provide your answer. "
+            "Put your thinking process inside <thinking>...</thinking> tags. "
+            "Your final answer should be the target's bounding box coordinates in the format [x1, y1, x2, y2], "
+            "where (x1, y1) is the top-left coordinate and (x2, y2) is the bottom-right coordinate. "
+            "Wrap your final answer in <answer>[x1, y1, x2, y2]</answer> tags."
+        )
+    else:
+        return base_prompt + (
+            "Please directly return the target's bounding box coordinates in the format [x1, y1, x2, y2], "
+            "where (x1, y1) is the top-left coordinate and (x2, y2) is the bottom-right coordinate. "
+            "Your answer should be wrapped in <answer>[x1, y1, x2, y2]</answer> tags."
+        )
+
+TRACKING_SYSTEM_PROMPT = get_tracking_system_prompt(False)
+# --- End ---
+
+# --- Bbox utility functions (remain the same) ---
+def convert_bbox_xywh_to_xyxy(bbox_xywh):
+    x, y, w, h = bbox_xywh
+    return [x, y, x + w, y + h]
+
+def convert_bbox_xyxy_to_xywh(bbox_xyxy):
+    x1, y1, x2, y2 = bbox_xyxy
+    return [x1, y1, x2 - x1, y2 - y1]
+
+def extract_single_bbox(response_text: str) -> Optional[List[int]]:
+    answer_match = re.search(r"<answer>(.*?)</answer>", response_text, re.DOTALL)
+    content = answer_match.group(1).strip() if answer_match else response_text.strip()
+    bbox_match = re.search(r"\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]", content)
+    if bbox_match:
+        return [int(coord) for coord in bbox_match.groups()]
+    logger.warning(f"Simplified: Failed to extract bounding box from response: {response_text}")
+    return None
+# --- End Bbox Utils ---
+
+# --- Model Loading (remains largely the same) ---
+def load_model_and_processor(model_path, device="auto"):
+    logger.info(f"Loading model from {model_path} to device {device}")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    # The processor might also handle some image processing, but we'll do explicit resizing first
+    processor = AutoProcessor.from_pretrained(model_path) 
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        device_map=device,
+        attn_implementation="flash_attention_2" if torch.cuda.is_available() else None # Conditional Flash Attention
+    )
+    model.eval()
+    return model, tokenizer, processor
+# --- End Model Loading ---
+
+# --- New Image Processing and Bbox Scaling Helpers (inspired by EasyR1/verl/utils/dataset.py) ---
+def process_image_for_inference(
+    image_pil: Image.Image, 
+    min_pixels: int, 
+    max_pixels: int
+) -> Image.Image:
+    """
+    Processes a PIL image similar to ImageProcessMixin in EasyR1.
+    Resizes based on min_pixels and max_pixels, and converts to RGB.
+    """
+    if not isinstance(image_pil, Image.Image):
+        raise TypeError("Input must be a PIL Image object.")
+
+    # Ensure min_pixels and max_pixels are valid
+    if min_pixels <= 0 or max_pixels <= 0 or min_pixels > max_pixels:
+        logger.warning(f"Invalid min_pixels ({min_pixels}) or max_pixels ({max_pixels}). Skipping resize based on pixel count.")
+    else:
+        if (image_pil.width * image_pil.height) > max_pixels:
+            resize_factor = math.sqrt(max_pixels / (image_pil.width * image_pil.height))
+            width, height = int(image_pil.width * resize_factor), int(image_pil.height * resize_factor)
+            if width > 0 and height > 0:
+                 image_pil = image_pil.resize((width, height), Image.Resampling.BILINEAR)
+            else:
+                logger.warning(f"Calculated zero dimension for resize based on max_pixels. Original: {image_pil.size}, Factor: {resize_factor}")
+
+
+        if (image_pil.width * image_pil.height) < min_pixels:
+            resize_factor = math.sqrt(min_pixels / (image_pil.width * image_pil.height))
+            width, height = int(image_pil.width * resize_factor), int(image_pil.height * resize_factor)
+            if width > 0 and height > 0:
+                image_pil = image_pil.resize((width, height), Image.Resampling.BILINEAR)
+            else:
+                logger.warning(f"Calculated zero dimension for resize based on min_pixels. Original: {image_pil.size}, Factor: {resize_factor}")
+
+
+    if image_pil.mode != "RGB":
+        image_pil = image_pil.convert("RGB")
+    return image_pil
+
+def scale_bbox_coordinates(
+    bbox_xyxy: List[int], 
+    scale_x: float, 
+    scale_y: float,
+    clamp_size: Optional[Tuple[int, int]] = None # (width, height) to clamp to
+) -> Optional[List[int]]:
+    """Scales bbox and optionally clamps it."""
+    x1, y1, x2, y2 = bbox_xyxy
+
+    x1_s = round(x1 * scale_x)
+    y1_s = round(y1 * scale_y)
+    x2_s = round(x2 * scale_x)
+    y2_s = round(y2 * scale_y)
+
+    if clamp_size and clamp_size[0] > 0 and clamp_size[1] > 0:
+        clamp_w, clamp_h = clamp_size
+        x1_s = max(0, min(x1_s, clamp_w - 1))
+        y1_s = max(0, min(y1_s, clamp_h - 1))
+        x2_s = max(0, min(x2_s, clamp_w - 1))
+        y2_s = max(0, min(y2_s, clamp_h - 1))
+    
+    # Ensure x1 <= x2 and y1 <= y2 after scaling and clamping
+    if x1_s > x2_s: x1_s, x2_s = x2_s, x1_s 
+    if y1_s > y2_s: y1_s, y2_s = y2_s, y1_s
+
+    if x1_s >= x2_s or y1_s >= y2_s: # Check for invalid box (width/height is zero or negative)
+        # logger.warning(f"Bbox {bbox_xyxy} became invalid [{x1_s},{y1_s},{x2_s},{y2_s}] after scaling/clamping. Scale factors: ({scale_x}, {scale_y}), Clamp: {clamp_size}")
+        return None # Or return the invalid box if downstream can handle it
+        
+    return [x1_s, y1_s, x2_s, y2_s]
+# --- End New Helpers ---
+
+
+# --- Prompt Building (remains largely the same, but bboxes are for resized images) ---
+def build_rft_input_messages(exp_str, template_pils_resized, search_pil_resized, template_bboxes_resized_for_text_prompt):
+    # This function now expects template_pils_resized and template_bboxes_resized_for_text_prompt
+    # where bboxes are already in the coordinate system of their respective resized template images.
+    user_content_list_of_dicts = []
+    for _ in template_pils_resized: # These are already resized PIL images
+        user_content_list_of_dicts.append({"type": "image"})
+    
+    if template_pils_resized:
+        for idx, template_bbox_in_resized_coords in enumerate(template_bboxes_resized_for_text_prompt):
+            if template_bbox_in_resized_coords: # Check if bbox is valid
+                bbox_text_content = (
+                    f"The bounding box for template frame {idx + 1} is: "
+                    f"[{int(template_bbox_in_resized_coords[0])}, {int(template_bbox_in_resized_coords[1])}, "
+                    f"{int(template_bbox_in_resized_coords[2])}, {int(template_bbox_in_resized_coords[3])}]."
+                )
+                user_content_list_of_dicts.append({"type": "text", "text": "\n" + bbox_text_content})
+            else: # Handle case where a template bbox might be invalid after scaling
+                user_content_list_of_dicts.append({"type": "text", "text": f"\nTemplate frame {idx + 1} is provided without a valid bounding box for text prompt."})
+
+
+    if template_pils_resized:
+        object_description_text = f"\nThese are the template frames showing the object '{exp_str}'."
+        user_content_list_of_dicts.append({"type": "text", "text": object_description_text})
+    
+    user_content_list_of_dicts.append({"type": "image"}) # For the search_pil_resized
+    
+    tracking_instruction_text = (
+        f" Please track the object '{exp_str}' in the search frame provided after the template frames. "
+        "Provide a bounding box for this search frame. "
+        "The bounding box should be in [x1, y1, x2, y2] format, relative to this search frame's (potentially resized) dimensions. " # Clarified prompt
+        "Wrap your answer in <answer>[x1, y1, x2, y2]</answer> tags."
+    )
+    user_content_list_of_dicts.append({"type": "text", "text": tracking_instruction_text})
+    
+    messages = [
+        {"role": "system", "content": TRACKING_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content_list_of_dicts}
+    ]
+    return messages
+# --- End Prompt Building ---
+
+# --- Visualization (remains the same) ---
+def draw_bbox_on_image(image_pil, bbox_xyxy, color="red", width=2):
+    if bbox_xyxy is None:
+        return image_pil
+    img_draw = image_pil.copy()
+    draw = ImageDraw.Draw(img_draw)
+    draw.rectangle(bbox_xyxy, outline=color, width=width)
+    return img_draw
+# --- End Visualization ---
+
+# --- History Management (remains the same, stores ORIGINAL paths and ORIGINAL bboxes) ---
+def update_history_indexed(
+    history_frame_paths: List[Optional[str]], 
+    history_bboxes_orig_xyxy: List[Optional[List[int]]], 
+    current_frame_idx: int,
+    current_frame_path: Optional[str], 
+    current_bbox_orig_xyxy: Optional[List[int]] 
+):
+    while len(history_frame_paths) <= current_frame_idx:
+        history_frame_paths.append(None)
+    while len(history_bboxes_orig_xyxy) <= current_frame_idx:
+        history_bboxes_orig_xyxy.append(None)
+    
+    history_frame_paths[current_frame_idx] = current_frame_path
+    history_bboxes_orig_xyxy[current_frame_idx] = current_bbox_orig_xyxy # Store original bbox
+    return history_frame_paths, history_bboxes_orig_xyxy
+
+def get_template_frames_by_gap(
+    current_frame_idx: int,
+    gap_list: List[int],
+    all_history_frame_paths: List[Optional[str]], 
+    all_history_bboxes_orig_xyxy: List[Optional[List[int]]], # Expects original bboxes
+    first_frame_path: str, 
+    first_frame_bbox_orig_xyxy: List[int]  # Original bbox for first frame
+) -> Tuple[List[Image.Image], List[List[int]]]: # Returns original PILs and original bboxes
+    selected_template_pils_orig = []
+    selected_template_bboxes_orig_xyxy = [] # These will be original coordinate bboxes
+    temp_selected_paths_bboxes = []
+
+    for gap in gap_list:
+        if gap <= 0: 
+            logger.warning(f"Invalid gap value {gap} <= 0, skipping.")
+            continue
+        template_frame_idx = current_frame_idx - gap
+        path_to_load = None
+        bbox_to_use_orig = None # This will be an original coordinate bbox
+
+        if template_frame_idx >= 0: # Template is from history or is the first frame
+            if template_frame_idx < len(all_history_frame_paths) and \
+               all_history_frame_paths[template_frame_idx] is not None and \
+               all_history_bboxes_orig_xyxy[template_frame_idx] is not None:
+                path_to_load = all_history_frame_paths[template_frame_idx]
+                bbox_to_use_orig = all_history_bboxes_orig_xyxy[template_frame_idx]
+            else: # Fallback if history is sparse or invalid for that index
+                logger.warning(f"History missing or invalid for frame index {template_frame_idx} (current_frame_idx: {current_frame_idx}, gap: {gap}). Using first frame as fallback.")
+                path_to_load = first_frame_path
+                bbox_to_use_orig = first_frame_bbox_orig_xyxy
+        else: # Template index is before the first frame, so use the first frame
+            # logger.info(f"Template index {template_frame_idx} is before first frame. Using first frame for gap {gap} at current frame {current_frame_idx}.")
+            path_to_load = first_frame_path
+            bbox_to_use_orig = first_frame_bbox_orig_xyxy
+        
+        if path_to_load and bbox_to_use_orig:
+            is_duplicate_path = any(p == path_to_load for p, _ in temp_selected_paths_bboxes)
+            if not is_duplicate_path:
+                temp_selected_paths_bboxes.append((path_to_load, bbox_to_use_orig))
+            # else:
+                # logger.info(f"Skipping duplicate template path '{path_to_load}' for gap {gap}.")
+    
+    for path, bbox_orig in temp_selected_paths_bboxes:
+        try:
+            pil_image = Image.open(path).convert("RGB")
+            selected_template_pils_orig.append(pil_image)
+            selected_template_bboxes_orig_xyxy.append(bbox_orig) # Add original bbox
+        except FileNotFoundError:
+            logger.error(f"Template frame not found: {path}. Skipping.")
+        except Exception as e:
+            logger.error(f"Error loading template frame {path}: {e}. Skipping.")
+
+
+    # If no templates were selected via gap_list (e.g., all gaps too large, or files missing)
+    # and it's not the first frame being processed (where templates aren't from history yet)
+    # default to using the first frame as the sole template.
+    if not selected_template_pils_orig and current_frame_idx >= 0 : # Allow empty if current_frame_idx is 0 (first frame)
+        logger.info("No templates selected via gap_list or loading failed, defaulting to first frame as the sole template.")
+        try:
+            pil_image = Image.open(first_frame_path).convert("RGB")
+            selected_template_pils_orig.append(pil_image)
+            selected_template_bboxes_orig_xyxy.append(first_frame_bbox_orig_xyxy)
+        except Exception as e:
+            logger.error(f"Failed to load default first frame template {first_frame_path}: {e}")
+            
+    return selected_template_pils_orig, selected_template_bboxes_orig_xyxy
+# --- End History Management ---
+
+
+def evaluate_tracking_rft(model, tokenizer, processor, sequences_names=None, dataset_name='lasot',
+                          save_visualize=False, output_dir="rft_tracking_results", 
+                          max_new_tokens=100, rank=0, 
+                          # smart_resize_factor is removed
+                          smart_resize_min_pixels=DEFAULT_MIN_PIXELS, 
+                          smart_resize_max_pixels=DEFAULT_MAX_PIXELS,
+                          gap_list: Optional[List[int]] = None):
+    
+    if gap_list is None:
+        gap_list = [1, 5] 
+    logger.info(f"Process {rank} - Using gap_list: {gap_list}, min_pixels: {smart_resize_min_pixels}, max_pixels: {smart_resize_max_pixels}")
+
+    dataset = get_dataset(dataset_name)
+    results_summary = []
+
+    if sequences_names:
+        filtered_dataset_seqs = [dataset[seq_name] for seq_name in sequences_names if seq_name in dataset.seq_names]
+        if not filtered_dataset_seqs:
+            logger.warning(f"Process {rank} - No valid sequences found to process.")
+            return []
+        dataset = SequenceList(filtered_dataset_seqs)
+    
+    logger.info(f"Process {rank} - Processing {len(dataset)} sequences.")
+
+    for seq_idx, seq in enumerate(tqdm(dataset, desc=f"Process {rank} - Tracking progress")):
+        seq_output_dir = os.path.join(output_dir, dataset_name, seq.name)
+        os.makedirs(seq_output_dir, exist_ok=True)
+        predictions_file_path = os.path.join(seq_output_dir, "predictions.txt")
+        
+        all_history_frame_paths: List[Optional[str]] = [] 
+        all_history_bboxes_orig_xyxy: List[Optional[List[int]]] = [] # Stores bboxes in ORIGINAL coordinates
+
+        first_frame_path = seq.frames[0]
+        first_frame_pil_orig = Image.open(first_frame_path).convert("RGB")
+        original_size_seq = first_frame_pil_orig.size # Assuming all frames in seq have same original size
+
+        # Process the first frame to determine the consistent resized_size for the sequence
+        # and the scaling factors for this sequence.
+        processed_first_frame_pil = process_image_for_inference(
+            first_frame_pil_orig.copy(), smart_resize_min_pixels, smart_resize_max_pixels
+        )
+        resized_size_seq = processed_first_frame_pil.size
+        
+        scale_x_seq, scale_y_seq = 1.0, 1.0
+        if original_size_seq[0] > 0 and original_size_seq[1] > 0:
+            scale_x_seq = resized_size_seq[0] / original_size_seq[0]
+            scale_y_seq = resized_size_seq[1] / original_size_seq[1]
+        else:
+            logger.error(f"Sequence {seq.name}: Invalid original_size_seq {original_size_seq}. Cannot calculate scales.")
+            continue # Skip sequence if basic info is bad
+
+        init_info = seq.init_info()
+        first_frame_gt_bbox_xywh = init_info.get('init_bbox')
+        first_frame_gt_bbox_original_xyxy = convert_bbox_xywh_to_xyxy(first_frame_gt_bbox_xywh)
+        exp_str = init_info.get('init_text_description', "the target object")
+
+        # Scale first frame's GT bbox for text prompt (if used as a template immediately)
+        first_frame_bbox_resized_for_prompt = scale_bbox_coordinates(
+            first_frame_gt_bbox_original_xyxy, scale_x_seq, scale_y_seq, resized_size_seq
+        )
+
+        if save_visualize: # Visualize with original image and original bbox
+            img_draw = draw_bbox_on_image(first_frame_pil_orig, first_frame_gt_bbox_original_xyxy)
+            img_draw.save(os.path.join(seq_output_dir, f"frame_0000_gt.jpg"))
+
+        with open(predictions_file_path, "w") as f:
+            f.write(f"{first_frame_gt_bbox_xywh[0]},{first_frame_gt_bbox_xywh[1]},{first_frame_gt_bbox_xywh[2]},{first_frame_gt_bbox_xywh[3]}\n")
+        
+        # Update history with original path and original bbox
+        all_history_frame_paths, all_history_bboxes_orig_xyxy = update_history_indexed(
+            all_history_frame_paths, all_history_bboxes_orig_xyxy,
+            0, first_frame_path, list(first_frame_gt_bbox_original_xyxy)
+        )
+
+        for i in range(1, len(seq.frames)):
+            current_prompt_template_pils_resized_for_model = [] 
+            current_prompt_template_bboxes_resized_for_text = []
+            
+            # get_template_frames_by_gap returns original PILs and original bboxes
+            selected_template_pils_orig, selected_template_bboxes_orig_xyxy = get_template_frames_by_gap(
+                current_frame_idx=i, gap_list=gap_list,
+                all_history_frame_paths=all_history_frame_paths,
+                all_history_bboxes_orig_xyxy=all_history_bboxes_orig_xyxy,
+                first_frame_path=first_frame_path, 
+                first_frame_bbox_orig_xyxy=first_frame_gt_bbox_original_xyxy
+            )
+            
+            if not selected_template_pils_orig: # Fallback if get_template_frames_by_gap returns empty
+                 logger.warning(f"No template frames selected by gap for frame {i}. Using first frame as sole prompt template.")
+                 # Process first frame original PIL to the sequence's resized_size_seq
+                 template_pil_resized = process_image_for_inference(first_frame_pil_orig.copy(), smart_resize_min_pixels, smart_resize_max_pixels)
+                 # template_pil_resized = first_frame_pil_orig.copy().resize(resized_size_seq, Image.Resampling.BILINEAR)
+                 current_prompt_template_pils_resized_for_model.append(template_pil_resized)
+                 current_prompt_template_bboxes_resized_for_text.append(first_frame_bbox_resized_for_prompt) # Already calculated
+            else:
+                for template_pil_orig, template_bbox_orig_xyxy in zip(selected_template_pils_orig, selected_template_bboxes_orig_xyxy):
+                    if template_pil_orig is None or template_bbox_orig_xyxy is None: 
+                        continue
+                    # Process original template PIL to the sequence's consistent resized_size_seq
+                    template_pil_resized = process_image_for_inference(template_pil_orig.copy(), smart_resize_min_pixels, smart_resize_max_pixels)
+                    # template_pil_resized = template_pil_orig.copy().resize(resized_size_seq, Image.Resampling.BILINEAR)
+                    
+                    # Scale its original bbox to resized coordinates for the prompt
+                    bbox_resized_for_text = scale_bbox_coordinates(
+                        template_bbox_orig_xyxy, scale_x_seq, scale_y_seq, resized_size_seq
+                    )
+                    if bbox_resized_for_text: 
+                        current_prompt_template_pils_resized_for_model.append(template_pil_resized)
+                        current_prompt_template_bboxes_resized_for_text.append(bbox_resized_for_text)
+            
+            if not current_prompt_template_pils_resized_for_model: # Should not happen if fallback works
+                logger.error(f"CRITICAL: No valid prompt templates for frame {i}. Skipping frame.")
+                # Write a dummy/failed prediction or handle appropriately
+                with open(predictions_file_path, "a") as f: f.write("0,0,0,0\n") 
+                all_history_frame_paths, all_history_bboxes_orig_xyxy = update_history_indexed(
+                    all_history_frame_paths, all_history_bboxes_orig_xyxy, i, seq.frames[i], None # Mark as failed
+                )
+                continue
+
+
+            current_search_frame_path = seq.frames[i]
+            search_pil_orig = Image.open(current_search_frame_path).convert("RGB")
+            # Process original search PIL to the sequence's consistent resized_size_seq
+            search_pil_resized_for_model = process_image_for_inference(search_pil_orig.copy(), smart_resize_min_pixels, smart_resize_max_pixels)
+            # search_pil_resized_for_model = search_pil_orig.copy().resize(resized_size_seq, Image.Resampling.BILINEAR)
+
+
+            messages = build_rft_input_messages(
+                exp_str, 
+                current_prompt_template_pils_resized_for_model, 
+                search_pil_resized_for_model, 
+                current_prompt_template_bboxes_resized_for_text
+            )
+            text_prompt_with_placeholders = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            # All images for the processor are now consistently resized PIL objects
+            all_images_for_sample = current_prompt_template_pils_resized_for_model + [search_pil_resized_for_model]
+            
+            try:
+                inputs = processor(
+                    text=[text_prompt_with_placeholders], images=all_images_for_sample,
+                    return_tensors="pt", padding=True,
+                )
+            except Exception as e:
+                logger.error(f"Error during processor call for seq {seq.name}, frame {i}: {e}")
+                logger.error(f"Prompt: {text_prompt_with_placeholders}")
+                logger.error(f"Number of images: {len(all_images_for_sample)}")
+                for idx, img_pil in enumerate(all_images_for_sample):
+                    logger.error(f"Image {idx} size: {img_pil.size}, mode: {img_pil.mode}")
+                # Fallback for this frame
+                with open(predictions_file_path, "a") as f: f.write("0,0,0,0\n")
+                all_history_frame_paths, all_history_bboxes_orig_xyxy = update_history_indexed(
+                    all_history_frame_paths, all_history_bboxes_orig_xyxy, i, current_search_frame_path, None
+                )
+                continue
+
+            inputs = inputs.to(model.device)
+
+            gen_config = GenerationConfig(
+                max_new_tokens=max_new_tokens, do_sample=False,
+                pad_token_id=processor.tokenizer.pad_token_id if processor.tokenizer.pad_token_id is not None else processor.tokenizer.eos_token_id,
+                eos_token_id=processor.tokenizer.eos_token_id
+            )
+            
+            with torch.no_grad():
+                generated_ids = model.generate(**inputs, generation_config=gen_config)
+            
+            input_token_len = inputs["input_ids"].shape[1]
+            generated_text_ids = generated_ids[:, input_token_len:]
+            response_text = processor.batch_decode(generated_text_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+            
+            # Predicted bbox is in the coordinate system of search_pil_resized_for_model (i.e., resized_size_seq)
+            predicted_bbox_resized_xyxy = extract_single_bbox(response_text)
+            
+            pred_bbox_xywh_final_for_file = [0,0,0,0] 
+            pred_bbox_original_xyxy_for_history = None
+
+            if predicted_bbox_resized_xyxy:
+                # Scale it back to original search image coordinates
+                pred_bbox_original_xyxy_for_history = scale_bbox_coordinates(
+                    predicted_bbox_resized_xyxy, 1.0/scale_x_seq if scale_x_seq else 1.0, 1.0/scale_y_seq if scale_y_seq else 1.0, original_size_seq
+                )
+                if pred_bbox_original_xyxy_for_history:
+                    pred_bbox_xywh_final_for_file = convert_bbox_xyxy_to_xywh(pred_bbox_original_xyxy_for_history)
+            
+            with open(predictions_file_path, "a") as f:
+                f.write(f"{pred_bbox_xywh_final_for_file[0]},{pred_bbox_xywh_final_for_file[1]},{pred_bbox_xywh_final_for_file[2]},{pred_bbox_xywh_final_for_file[3]}\n")
+
+            if save_visualize: # Visualize with original search image and predicted bbox in original coords
+                img_draw = draw_bbox_on_image(search_pil_orig, pred_bbox_original_xyxy_for_history)
+                img_draw.save(os.path.join(seq_output_dir, f"frame_{i:04d}_pred.jpg"))
+
+            # Update history with current search frame's path and its *original coordinate* predicted bbox
+            all_history_frame_paths, all_history_bboxes_orig_xyxy = update_history_indexed(
+                all_history_frame_paths, all_history_bboxes_orig_xyxy,
+                i, current_search_frame_path, pred_bbox_original_xyxy_for_history # Store original for next iter
+            )
+
+        results_summary.append({'sequence': seq.name, 'output_file': predictions_file_path})
+        logger.info(f"Process {rank} - Finished sequence {seq.name}. Predictions saved to {predictions_file_path}")
+        
+    return results_summary
+# ... (rest of the script: split_sequences, run_process_wrapper, main) ...
+
+def split_sequences(seq_list_all_names, rank, world_size):
+    if not seq_list_all_names: return []
+    n_total = len(seq_list_all_names)
+    n_per_rank = math.ceil(n_total / world_size)
+    start_idx = rank * n_per_rank
+    end_idx = min((rank + 1) * n_per_rank, n_total)
+    return seq_list_all_names[start_idx:end_idx] if start_idx < n_total else []
+
+def run_process_wrapper(rank, world_size, args):
+    device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available(): torch.cuda.set_device(rank)
+    
+    logger.info(f"Process {rank} started on device {device}")
+    model, tokenizer, processor = load_model_and_processor(args.model_path, device=device)
+    
+    all_sequence_names = [seq.name for seq in get_dataset(args.dataset_name)]
+    sequences_for_this_rank = [args.sequence] if args.sequence and rank == 0 else \
+                              split_sequences(all_sequence_names, rank, world_size) if not args.sequence else []
+
+    if not sequences_for_this_rank:
+        logger.info(f"Process {rank} has no sequences to process.")
+        return []
+
+    logger.info(f"Process {rank} will process sequences: {sequences_for_this_rank}")
+    
+    return evaluate_tracking_rft(
+        model, tokenizer, processor,
+        sequences_names=sequences_for_this_rank,
+        dataset_name=args.dataset_name,
+        save_visualize=args.save_vis,
+        output_dir=args.output_dir,
+        max_new_tokens=args.max_new_tokens,
+        rank=rank,
+        # smart_resize_factor is removed
+        smart_resize_min_pixels=args.smart_resize_min_pixels,
+        smart_resize_max_pixels=args.smart_resize_max_pixels,
+        gap_list=args.gap_list
+    )
+
+def main():
+    parser = argparse.ArgumentParser(description="RFT Model Single Object Tracking Inference (EasyR1 Style Processing)")
+    parser.add_argument("--model_path", type=str, required=True, help="Path to the fine-tuned RFT model")
+    parser.add_argument("--dataset_name", type=str, default="OTB_lang", help="Dataset name")
+    parser.add_argument("--sequence", type=str, default=None, help="Specific sequence name (optional)")
+    parser.add_argument("--output_dir", type=str, default="rft_tracking_results_easyr1_style", help="Output directory")
+    parser.add_argument("--save_vis", type=lambda x: (str(x).lower() == 'true'), default=False, help="Save visualizations (true/false)")
+    parser.add_argument("--max_new_tokens", type=int, default=100, help="Max new tokens for generation (reduced for tracking)") # Default was 2048
+    # parser.add_argument("--smart_resize_factor", type=int, default=DEFAULT_FACTOR, help="Factor for smart resize") # Removed
+    parser.add_argument("--smart_resize_min_pixels", type=int, default=DEFAULT_MIN_PIXELS, help="Min pixels for image processing (like EasyR1)")
+    parser.add_argument("--smart_resize_max_pixels", type=int, default=DEFAULT_MAX_PIXELS, help="Max pixels for image processing (like EasyR1)")
+    parser.add_argument("--gap_list", type=int, nargs='+', default=None, help="List of gaps for selecting template frames (e.g., --gap_list 1 5). If None, uses default [1, 5].")
+    parser.add_argument("--single_process", action="store_true", help="Force single process")
+    args = parser.parse_args()
+
+    if args.gap_list is None:
+        args.gap_list = [1, 5] 
+    logger.info(f"Using gap_list: {args.gap_list}")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    use_multiprocessing = torch.cuda.device_count() > 1 and not args.single_process
+    
+    if use_multiprocessing:
+        world_size = torch.cuda.device_count()
+        logger.info(f"Detected {world_size} GPUs, enabling multi-process evaluation.")
+        if mp.get_start_method(allow_none=True) != 'spawn': # Check before setting
+            try:
+                mp.set_start_method('spawn', force=True)
+            except RuntimeError as e:
+                logger.warning(f"Could not set start_method to 'spawn': {e}. Using default.")
+
+        with Pool(world_size) as pool:
+            func = functools.partial(run_process_wrapper, world_size=world_size, args=args)
+            results_list_of_lists = pool.map(func, range(world_size))
+        all_results_summary = [item for sublist in results_list_of_lists for item in sublist if sublist] # Ensure sublist is not None
+    else:
+        logger.info("Using single process evaluation.")
+        rank = 0
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        model, tokenizer, processor = load_model_and_processor(args.model_path, device=device)
+        all_sequence_names = [seq.name for seq in get_dataset(args.dataset_name)]
+        sequences_to_run = [args.sequence] if args.sequence else all_sequence_names
+        if not sequences_to_run:
+            logger.info("No sequences selected.")
+            return
+        all_results_summary = evaluate_tracking_rft(
+            model, tokenizer, processor, sequences_names=sequences_to_run,
+            dataset_name=args.dataset_name, save_visualize=args.save_vis,
+            output_dir=args.output_dir, max_new_tokens=args.max_new_tokens, rank=rank,
+            # smart_resize_factor is removed
+            smart_resize_min_pixels=args.smart_resize_min_pixels,
+            smart_resize_max_pixels=args.smart_resize_max_pixels,
+            gap_list=args.gap_list
+        )
+
+    if all_results_summary: # Check if there are any results
+        summary_file = os.path.join(args.output_dir, f"tracking_summary_{args.dataset_name}.json")
+        with open(summary_file, "w") as f:
+            json.dump(all_results_summary, f, indent=2)
+        logger.info(f"Overall tracking summary saved to {summary_file}")
+    else:
+        logger.info("No results to summarize.")
+
+if __name__ == "__main__":
+    main()
+```// filepath: /data1/lihaobo/track_r1/dataset_interface/rft_tracking_inference.py
+import os
+import re
+import json
+import argparse
+import logging
+# import time # Not used
+import torch
+# import numpy as np # Not used
+from PIL import Image, ImageDraw, ImageFile
+from tqdm import tqdm
+# import matplotlib.pyplot as plt # Not used
+from transformers import AutoProcessor, GenerationConfig
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer
+# sys.path.append( # Assuming evaluation.datasets is accessible or part of EasyR1 structure
+#     os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'rft/src/virft/src'))
+# )
+
+# If evaluation.datasets is part of a different structure, adjust path or ensure PYTHONPATH is set
+# For now, assuming it's findable. If it's part of EasyR1, it might be:
+# from EasyR1.evaluation.datasets import get_dataset, SequenceList
+# Or if this script is intended to be run from within dataset_interface:
+from evaluation.datasets import get_dataset, SequenceList
+
+
+import functools
+import multiprocessing as mp
+from multiprocessing import Pool
+import math
+from typing import List, Optional, Tuple
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True # Helpful for some datasets
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Constants from EasyR1/verl/utils/dataset.py (or similar if they were args)
+# These will now come from args: smart_resize_min_pixels, smart_resize_max_pixels
+# DEFAULT_FACTOR = 28 # No longer used
+DEFAULT_MIN_PIXELS = 3136  # Example, should match training if possible
+DEFAULT_MAX_PIXELS = 102400 # Example, should match training if possible
+
+
+# --- Tracking System Prompt (remains the same) ---
+def get_tracking_system_prompt(use_thinking=False):
+    """获取追踪任务的系统提示"""
+    base_prompt = (
+        "You are a professional visual object tracking assistant. Your task is to track a specified target object. "
+        "The user will provide template frames showing the target object. "
+        "First, identify the target in the template frames. Then, locate the target's position in the following search frames."
+    )
+    
+    if use_thinking: 
+        return base_prompt + (
+            "You should first think about how to locate the target by analyzing visual features, then provide your answer. "
+            "Put your thinking process inside <thinking>...</thinking> tags. "
+            "Your final answer should be the target's bounding box coordinates in the format [x1, y1, x2, y2], "
+            "where (x1, y1) is the top-left coordinate and (x2, y2) is the bottom-right coordinate. "
+            "Wrap your final answer in <answer>[x1, y1, x2, y2]</answer> tags."
+        )
+    else:
+        return base_prompt + (
+            "Please directly return the target's bounding box coordinates in the format [x1, y1, x2, y2], "
+            "where (x1, y1) is the top-left coordinate and (x2, y2) is the bottom-right coordinate. "
+            "Your answer should be wrapped in <answer>[x1, y1, x2, y2]</answer> tags."
+        )
+
+TRACKING_SYSTEM_PROMPT = get_tracking_system_prompt(False)
+# --- End ---
+
+# --- Bbox utility functions (remain the same) ---
+def convert_bbox_xywh_to_xyxy(bbox_xywh):
+    x, y, w, h = bbox_xywh
+    return [x, y, x + w, y + h]
+
+def convert_bbox_xyxy_to_xywh(bbox_xyxy):
+    x1, y1, x2, y2 = bbox_xyxy
+    return [x1, y1, x2 - x1, y2 - y1]
+
+def extract_single_bbox(response_text: str) -> Optional[List[int]]:
+    answer_match = re.search(r"<answer>(.*?)</answer>", response_text, re.DOTALL)
+    content = answer_match.group(1).strip() if answer_match else response_text.strip()
+    bbox_match = re.search(r"\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]", content)
+    if bbox_match:
+        return [int(coord) for coord in bbox_match.groups()]
+    logger.warning(f"Simplified: Failed to extract bounding box from response: {response_text}")
+    return None
+# --- End Bbox Utils ---
+
+# --- Model Loading (remains largely the same) ---
+def load_model_and_processor(model_path, device="auto"):
+    logger.info(f"Loading model from {model_path} to device {device}")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    # The processor might also handle some image processing, but we'll do explicit resizing first
+    processor = AutoProcessor.from_pretrained(model_path) 
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        device_map=device,
+        attn_implementation="flash_attention_2" if torch.cuda.is_available() else None # Conditional Flash Attention
+    )
+    model.eval()
+    return model, tokenizer, processor
+# --- End Model Loading ---
+
+# --- New Image Processing and Bbox Scaling Helpers (inspired by EasyR1/verl/utils/dataset.py) ---
+def process_image_for_inference(
+    image_pil: Image.Image, 
+    min_pixels: int, 
+    max_pixels: int
+) -> Image.Image:
+    """
+    Processes a PIL image similar to ImageProcessMixin in EasyR1.
+    Resizes based on min_pixels and max_pixels, and converts to RGB.
+    """
+    if not isinstance(image_pil, Image.Image):
+        raise TypeError("Input must be a PIL Image object.")
+
+    # Ensure min_pixels and max_pixels are valid
+    if min_pixels <= 0 or max_pixels <= 0 or min_pixels > max_pixels:
+        logger.warning(f"Invalid min_pixels ({min_pixels}) or max_pixels ({max_pixels}). Skipping resize based on pixel count.")
+    else:
+        if (image_pil.width * image_pil.height) > max_pixels:
+            resize_factor = math.sqrt(max_pixels / (image_pil.width * image_pil.height))
+            width, height = int(image_pil.width * resize_factor), int(image_pil.height * resize_factor)
+            if width > 0 and height > 0:
+                 image_pil = image_pil.resize((width, height), Image.Resampling.BILINEAR)
+            else:
+                logger.warning(f"Calculated zero dimension for resize based on max_pixels. Original: {image_pil.size}, Factor: {resize_factor}")
+
+
+        if (image_pil.width * image_pil.height) < min_pixels:
+            resize_factor = math.sqrt(min_pixels / (image_pil.width * image_pil.height))
+            width, height = int(image_pil.width * resize_factor), int(image_pil.height * resize_factor)
+            if width > 0 and height > 0:
+                image_pil = image_pil.resize((width, height), Image.Resampling.BILINEAR)
+            else:
+                logger.warning(f"Calculated zero dimension for resize based on min_pixels. Original: {image_pil.size}, Factor: {resize_factor}")
+
+
+    if image_pil.mode != "RGB":
+        image_pil = image_pil.convert("RGB")
+    return image_pil
+
+def scale_bbox_coordinates(
+    bbox_xyxy: List[int], 
+    scale_x: float, 
+    scale_y: float,
+    clamp_size: Optional[Tuple[int, int]] = None # (width, height) to clamp to
+) -> Optional[List[int]]:
+    """Scales bbox and optionally clamps it."""
+    x1, y1, x2, y2 = bbox_xyxy
+
+    x1_s = round(x1 * scale_x)
+    y1_s = round(y1 * scale_y)
+    x2_s = round(x2 * scale_x)
+    y2_s = round(y2 * scale_y)
+
+    if clamp_size and clamp_size[0] > 0 and clamp_size[1] > 0:
+        clamp_w, clamp_h = clamp_size
+        x1_s = max(0, min(x1_s, clamp_w - 1))
+        y1_s = max(0, min(y1_s, clamp_h - 1))
+        x2_s = max(0, min(x2_s, clamp_w - 1))
+        y2_s = max(0, min(y2_s, clamp_h - 1))
+    
+    # Ensure x1 <= x2 and y1 <= y2 after scaling and clamping
+    if x1_s > x2_s: x1_s, x2_s = x2_s, x1_s 
+    if y1_s > y2_s: y1_s, y2_s = y2_s, y1_s
+
+    if x1_s >= x2_s or y1_s >= y2_s: # Check for invalid box (width/height is zero or negative)
+        # logger.warning(f"Bbox {bbox_xyxy} became invalid [{x1_s},{y1_s},{x2_s},{y2_s}] after scaling/clamping. Scale factors: ({scale_x}, {scale_y}), Clamp: {clamp_size}")
+        return None # Or return the invalid box if downstream can handle it
+        
+    return [x1_s, y1_s, x2_s, y2_s]
+# --- End New Helpers ---
+
+
+# --- Prompt Building (remains largely the same, but bboxes are for resized images) ---
+def build_rft_input_messages(exp_str, template_pils_resized, search_pil_resized, template_bboxes_resized_for_text_prompt):
+    # This function now expects template_pils_resized and template_bboxes_resized_for_text_prompt
+    # where bboxes are already in the coordinate system of their respective resized template images.
+    user_content_list_of_dicts = []
+    for _ in template_pils_resized: # These are already resized PIL images
+        user_content_list_of_dicts.append({"type": "image"})
+    
+    if template_pils_resized:
+        for idx, template_bbox_in_resized_coords in enumerate(template_bboxes_resized_for_text_prompt):
+            if template_bbox_in_resized_coords: # Check if bbox is valid
+                bbox_text_content = (
+                    f"The bounding box for template frame {idx + 1} is: "
+                    f"[{int(template_bbox_in_resized_coords[0])}, {int(template_bbox_in_resized_coords[1])}, "
+                    f"{int(template_bbox_in_resized_coords[2])}, {int(template_bbox_in_resized_coords[3])}]."
+                )
+                user_content_list_of_dicts.append({"type": "text", "text": "\n" + bbox_text_content})
+            else: # Handle case where a template bbox might be invalid after scaling
+                user_content_list_of_dicts.append({"type": "text", "text": f"\nTemplate frame {idx + 1} is provided without a valid bounding box for text prompt."})
+
+
+    if template_pils_resized:
+        object_description_text = f"\nThese are the template frames showing the object '{exp_str}'."
+        user_content_list_of_dicts.append({"type": "text", "text": object_description_text})
+    
+    user_content_list_of_dicts.append({"type": "image"}) # For the search_pil_resized
+    
+    tracking_instruction_text = (
+        f" Please track the object '{exp_str}' in the search frame provided after the template frames. "
+        "Provide a bounding box for this search frame. "
+        "The bounding box should be in [x1, y1, x2, y2] format, relative to this search frame's (potentially resized) dimensions. " # Clarified prompt
+        "Wrap your answer in <answer>[x1, y1, x2, y2]</answer> tags."
+    )
+    user_content_list_of_dicts.append({"type": "text", "text": tracking_instruction_text})
+    
+    messages = [
+        {"role": "system", "content": TRACKING_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content_list_of_dicts}
+    ]
+    return messages
+# --- End Prompt Building ---
+
+# --- Visualization (remains the same) ---
+def draw_bbox_on_image(image_pil, bbox_xyxy, color="red", width=2):
+    if bbox_xyxy is None:
+        return image_pil
+    img_draw = image_pil.copy()
+    draw = ImageDraw.Draw(img_draw)
+    draw.rectangle(bbox_xyxy, outline=color, width=width)
+    return img_draw
+# --- End Visualization ---
+
+# --- History Management (remains the same, stores ORIGINAL paths and ORIGINAL bboxes) ---
+def update_history_indexed(
+    history_frame_paths: List[Optional[str]], 
+    history_bboxes_orig_xyxy: List[Optional[List[int]]], 
+    current_frame_idx: int,
+    current_frame_path: Optional[str], 
+    current_bbox_orig_xyxy: Optional[List[int]] 
+):
+    while len(history_frame_paths) <= current_frame_idx:
+        history_frame_paths.append(None)
+    while len(history_bboxes_orig_xyxy) <= current_frame_idx:
+        history_bboxes_orig_xyxy.append(None)
+    
+    history_frame_paths[current_frame_idx] = current_frame_path
+    history_bboxes_orig_xyxy[current_frame_idx] = current_bbox_orig_xyxy # Store original bbox
+    return history_frame_paths, history_bboxes_orig_xyxy
+
+def get_template_frames_by_gap(
+    current_frame_idx: int,
+    gap_list: List[int],
+    all_history_frame_paths: List[Optional[str]], 
+    all_history_bboxes_orig_xyxy: List[Optional[List[int]]], # Expects original bboxes
+    first_frame_path: str, 
+    first_frame_bbox_orig_xyxy: List[int]  # Original bbox for first frame
+) -> Tuple[List[Image.Image], List[List[int]]]: # Returns original PILs and original bboxes
+    selected_template_pils_orig = []
+    selected_template_bboxes_orig_xyxy = [] # These will be original coordinate bboxes
+    temp_selected_paths_bboxes = []
+
+    for gap in gap_list:
+        if gap <= 0: 
+            logger.warning(f"Invalid gap value {gap} <= 0, skipping.")
+            continue
+        template_frame_idx = current_frame_idx - gap
+        path_to_load = None
+        bbox_to_use_orig = None # This will be an original coordinate bbox
+
+        if template_frame_idx >= 0: # Template is from history or is the first frame
+            if template_frame_idx < len(all_history_frame_paths) and \
+               all_history_frame_paths[template_frame_idx] is not None and \
+               all_history_bboxes_orig_xyxy[template_frame_idx] is not None:
+                path_to_load = all_history_frame_paths[template_frame_idx]
+                bbox_to_use_orig = all_history_bboxes_orig_xyxy[template_frame_idx]
+            else: # Fallback if history is sparse or invalid for that index
+                logger.warning(f"History missing or invalid for frame index {template_frame_idx} (current_frame_idx: {current_frame_idx}, gap: {gap}). Using first frame as fallback.")
+                path_to_load = first_frame_path
+                bbox_to_use_orig = first_frame_bbox_orig_xyxy
+        else: # Template index is before the first frame, so use the first frame
+            # logger.info(f"Template index {template_frame_idx} is before first frame. Using first frame for gap {gap} at current frame {current_frame_idx}.")
+            path_to_load = first_frame_path
+            bbox_to_use_orig = first_frame_bbox_orig_xyxy
+        
+        if path_to_load and bbox_to_use_orig:
+            is_duplicate_path = any(p == path_to_load for p, _ in temp_selected_paths_bboxes)
+            if not is_duplicate_path:
+                temp_selected_paths_bboxes.append((path_to_load, bbox_to_use_orig))
+            # else:
+                # logger.info(f"Skipping duplicate template path '{path_to_load}' for gap {gap}.")
+    
+    for path, bbox_orig in temp_selected_paths_bboxes:
+        try:
+            pil_image = Image.open(path).convert("RGB")
+            selected_template_pils_orig.append(pil_image)
+            selected_template_bboxes_orig_xyxy.append(bbox_orig) # Add original bbox
+        except FileNotFoundError:
+            logger.error(f"Template frame not found: {path}. Skipping.")
+        except Exception as e:
+            logger.error(f"Error loading template frame {path}: {e}. Skipping.")
+
+
+    # If no templates were selected via gap_list (e.g., all gaps too large, or files missing)
+    # and it's not the first frame being processed (where templates aren't from history yet)
+    # default to using the first frame as the sole template.
+    if not selected_template_pils_orig and current_frame_idx >= 0 : # Allow empty if current_frame_idx is 0 (first frame)
+        logger.info("No templates selected via gap_list or loading failed, defaulting to first frame as the sole template.")
+        try:
+            pil_image = Image.open(first_frame_path).convert("RGB")
+            selected_template_pils_orig.append(pil_image)
+            selected_template_bboxes_orig_xyxy.append(first_frame_bbox_orig_xyxy)
+        except Exception as e:
+            logger.error(f"Failed to load default first frame template {first_frame_path}: {e}")
+            
+    return selected_template_pils_orig, selected_template_bboxes_orig_xyxy
+# --- End History Management ---
+
+
+def evaluate_tracking_rft(model, tokenizer, processor, sequences_names=None, dataset_name='lasot',
+                          save_visualize=False, output_dir="rft_tracking_results", 
+                          max_new_tokens=100, rank=0, 
+                          # smart_resize_factor is removed
+                          smart_resize_min_pixels=DEFAULT_MIN_PIXELS, 
+                          smart_resize_max_pixels=DEFAULT_MAX_PIXELS,
+                          gap_list: Optional[List[int]] = None):
+    
+    if gap_list is None:
+        gap_list = [1, 5] 
+    logger.info(f"Process {rank} - Using gap_list: {gap_list}, min_pixels: {smart_resize_min_pixels}, max_pixels: {smart_resize_max_pixels}")
+
+    dataset = get_dataset(dataset_name)
+    results_summary = []
+
+    if sequences_names:
+        filtered_dataset_seqs = [dataset[seq_name] for seq_name in sequences_names if seq_name in dataset.seq_names]
+        if not filtered_dataset_seqs:
+            logger.warning(f"Process {rank} - No valid sequences found to process.")
+            return []
+        dataset = SequenceList(filtered_dataset_seqs)
+    
+    logger.info(f"Process {rank} - Processing {len(dataset)} sequences.")
+
+    for seq_idx, seq in enumerate(tqdm(dataset, desc=f"Process {rank} - Tracking progress")):
+        seq_output_dir = os.path.join(output_dir, dataset_name, seq.name)
+        os.makedirs(seq_output_dir, exist_ok=True)
+        predictions_file_path = os.path.join(seq_output_dir, "predictions.txt")
+        
+        all_history_frame_paths: List[Optional[str]] = [] 
+        all_history_bboxes_orig_xyxy: List[Optional[List[int]]] = [] # Stores bboxes in ORIGINAL coordinates
+
+        first_frame_path = seq.frames[0]
+        first_frame_pil_orig = Image.open(first_frame_path).convert("RGB")
+        original_size_seq = first_frame_pil_orig.size # Assuming all frames in seq have same original size
+
+        # Process the first frame to determine the consistent resized_size for the sequence
+        # and the scaling factors for this sequence.
+        processed_first_frame_pil = process_image_for_inference(
+            first_frame_pil_orig.copy(), smart_resize_min_pixels, smart_resize_max_pixels
+        )
+        resized_size_seq = processed_first_frame_pil.size
+        
+        scale_x_seq, scale_y_seq = 1.0, 1.0
+        if original_size_seq[0] > 0 and original_size_seq[1] > 0:
+            scale_x_seq = resized_size_seq[0] / original_size_seq[0]
+            scale_y_seq = resized_size_seq[1] / original_size_seq[1]
+        else:
+            logger.error(f"Sequence {seq.name}: Invalid original_size_seq {original_size_seq}. Cannot calculate scales.")
+            continue # Skip sequence if basic info is bad
+
+        init_info = seq.init_info()
+        first_frame_gt_bbox_xywh = init_info.get('init_bbox')
+        first_frame_gt_bbox_original_xyxy = convert_bbox_xywh_to_xyxy(first_frame_gt_bbox_xywh)
+        exp_str = init_info.get('init_text_description', "the target object")
+
+        # Scale first frame's GT bbox for text prompt (if used as a template immediately)
+        first_frame_bbox_resized_for_prompt = scale_bbox_coordinates(
+            first_frame_gt_bbox_original_xyxy, scale_x_seq, scale_y_seq, resized_size_seq
+        )
+
+        if save_visualize: # Visualize with original image and original bbox
+            img_draw = draw_bbox_on_image(first_frame_pil_orig, first_frame_gt_bbox_original_xyxy)
+            img_draw.save(os.path.join(seq_output_dir, f"frame_0000_gt.jpg"))
+
+        with open(predictions_file_path, "w") as f:
+            f.write(f"{first_frame_gt_bbox_xywh[0]},{first_frame_gt_bbox_xywh[1]},{first_frame_gt_bbox_xywh[2]},{first_frame_gt_bbox_xywh[3]}\n")
+        
+        # Update history with original path and original bbox
+        all_history_frame_paths, all_history_bboxes_orig_xyxy = update_history_indexed(
+            all_history_frame_paths, all_history_bboxes_orig_xyxy,
+            0, first_frame_path, list(first_frame_gt_bbox_original_xyxy)
+        )
+
+        for i in range(1, len(seq.frames)):
+            current_prompt_template_pils_resized_for_model = [] 
+            current_prompt_template_bboxes_resized_for_text = []
+            
+            # get_template_frames_by_gap returns original PILs and original bboxes
+            selected_template_pils_orig, selected_template_bboxes_orig_xyxy = get_template_frames_by_gap(
+                current_frame_idx=i, gap_list=gap_list,
+                all_history_frame_paths=all_history_frame_paths,
+                all_history_bboxes_orig_xyxy=all_history_bboxes_orig_xyxy,
+                first_frame_path=first_frame_path, 
+                first_frame_bbox_orig_xyxy=first_frame_gt_bbox_original_xyxy
+            )
+            
+            if not selected_template_pils_orig: # Fallback if get_template_frames_by_gap returns empty
+                 logger.warning(f"No template frames selected by gap for frame {i}. Using first frame as sole prompt template.")
+                 # Process first frame original PIL to the sequence's resized_size_seq
+                 template_pil_resized = process_image_for_inference(first_frame_pil_orig.copy(), smart_resize_min_pixels, smart_resize_max_pixels)
+                 # template_pil_resized = first_frame_pil_orig.copy().resize(resized_size_seq, Image.Resampling.BILINEAR)
+                 current_prompt_template_pils_resized_for_model.append(template_pil_resized)
+                 current_prompt_template_bboxes_resized_for_text.append(first_frame_bbox_resized_for_prompt) # Already calculated
+            else:
+                for template_pil_orig, template_bbox_orig_xyxy in zip(selected_template_pils_orig, selected_template_bboxes_orig_xyxy):
+                    if template_pil_orig is None or template_bbox_orig_xyxy is None: 
+                        continue
+                    # Process original template PIL to the sequence's consistent resized_size_seq
+                    template_pil_resized = process_image_for_inference(template_pil_orig.copy(), smart_resize_min_pixels, smart_resize_max_pixels)
+                    # template_pil_resized = template_pil_orig.copy().resize(resized_size_seq, Image.Resampling.BILINEAR)
+                    
+                    # Scale its original bbox to resized coordinates for the prompt
+                    bbox_resized_for_text = scale_bbox_coordinates(
+                        template_bbox_orig_xyxy, scale_x_seq, scale_y_seq, resized_size_seq
+                    )
+                    if bbox_resized_for_text: 
+                        current_prompt_template_pils_resized_for_model.append(template_pil_resized)
+                        current_prompt_template_bboxes_resized_for_text.append(bbox_resized_for_text)
+            
+            if not current_prompt_template_pils_resized_for_model: # Should not happen if fallback works
+                logger.error(f"CRITICAL: No valid prompt templates for frame {i}. Skipping frame.")
+                # Write a dummy/failed prediction or handle appropriately
+                with open(predictions_file_path, "a") as f: f.write("0,0,0,0\n") 
+                all_history_frame_paths, all_history_bboxes_orig_xyxy = update_history_indexed(
+                    all_history_frame_paths, all_history_bboxes_orig_xyxy, i, seq.frames[i], None # Mark as failed
+                )
+                continue
+
+
+            current_search_frame_path = seq.frames[i]
+            search_pil_orig = Image.open(current_search_frame_path).convert("RGB")
+            # Process original search PIL to the sequence's consistent resized_size_seq
+            search_pil_resized_for_model = process_image_for_inference(search_pil_orig.copy(), smart_resize_min_pixels, smart_resize_max_pixels)
+            # search_pil_resized_for_model = search_pil_orig.copy().resize(resized_size_seq, Image.Resampling.BILINEAR)
+
+
+            messages = build_rft_input_messages(
+                exp_str, 
+                current_prompt_template_pils_resized_for_model, 
+                search_pil_resized_for_model, 
+                current_prompt_template_bboxes_resized_for_text
+            )
+            text_prompt_with_placeholders = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            # All images for the processor are now consistently resized PIL objects
+            all_images_for_sample = current_prompt_template_pils_resized_for_model + [search_pil_resized_for_model]
+            
+            try:
+                inputs = processor(
+                    text=[text_prompt_with_placeholders], images=all_images_for_sample,
+                    return_tensors="pt", padding=True,
+                )
+            except Exception as e:
+                logger.error(f"Error during processor call for seq {seq.name}, frame {i}: {e}")
+                logger.error(f"Prompt: {text_prompt_with_placeholders}")
+                logger.error(f"Number of images: {len(all_images_for_sample)}")
+                for idx, img_pil in enumerate(all_images_for_sample):
+                    logger.error(f"Image {idx} size: {img_pil.size}, mode: {img_pil.mode}")
+                # Fallback for this frame
+                with open(predictions_file_path, "a") as f: f.write("0,0,0,0\n")
+                all_history_frame_paths, all_history_bboxes_orig_xyxy = update_history_indexed(
+                    all_history_frame_paths, all_history_bboxes_orig_xyxy, i, current_search_frame_path, None
+                )
+                continue
+
+            inputs = inputs.to(model.device)
+
+            gen_config = GenerationConfig(
+                max_new_tokens=max_new_tokens, do_sample=False,
+                pad_token_id=processor.tokenizer.pad_token_id if processor.tokenizer.pad_token_id is not None else processor.tokenizer.eos_token_id,
+                eos_token_id=processor.tokenizer.eos_token_id
+            )
+            
+            with torch.no_grad():
+                generated_ids = model.generate(**inputs, generation_config=gen_config)
+            
+            input_token_len = inputs["input_ids"].shape[1]
+            generated_text_ids = generated_ids[:, input_token_len:]
+            response_text = processor.batch_decode(generated_text_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+            
+            # Predicted bbox is in the coordinate system of search_pil_resized_for_model (i.e., resized_size_seq)
+            predicted_bbox_resized_xyxy = extract_single_bbox(response_text)
+            
+            pred_bbox_xywh_final_for_file = [0,0,0,0] 
+            pred_bbox_original_xyxy_for_history = None
+
+            if predicted_bbox_resized_xyxy:
+                # Scale it back to original search image coordinates
+                pred_bbox_original_xyxy_for_history = scale_bbox_coordinates(
+                    predicted_bbox_resized_xyxy, 1.0/scale_x_seq if scale_x_seq else 1.0, 1.0/scale_y_seq if scale_y_seq else 1.0, original_size_seq
+                )
+                if pred_bbox_original_xyxy_for_history:
+                    pred_bbox_xywh_final_for_file = convert_bbox_xyxy_to_xywh(pred_bbox_original_xyxy_for_history)
+            
+            with open(predictions_file_path, "a") as f:
+                f.write(f"{pred_bbox_xywh_final_for_file[0]},{pred_bbox_xywh_final_for_file[1]},{pred_bbox_xywh_final_for_file[2]},{pred_bbox_xywh_final_for_file[3]}\n")
+
+            if save_visualize: # Visualize with original search image and predicted bbox in original coords
+                img_draw = draw_bbox_on_image(search_pil_orig, pred_bbox_original_xyxy_for_history)
+                img_draw.save(os.path.join(seq_output_dir, f"frame_{i:04d}_pred.jpg"))
+
+            # Update history with current search frame's path and its *original coordinate* predicted bbox
+            all_history_frame_paths, all_history_bboxes_orig_xyxy = update_history_indexed(
+                all_history_frame_paths, all_history_bboxes_orig_xyxy,
+                i, current_search_frame_path, pred_bbox_original_xyxy_for_history # Store original for next iter
+            )
+
+        results_summary.append({'sequence': seq.name, 'output_file': predictions_file_path})
+        logger.info(f"Process {rank} - Finished sequence {seq.name}. Predictions saved to {predictions_file_path}")
+        
+    return results_summary
+# ... (rest of the script: split_sequences, run_process_wrapper, main) ...
+
+def split_sequences(seq_list_all_names, rank, world_size):
+    if not seq_list_all_names: return []
+    n_total = len(seq_list_all_names)
+    n_per_rank = math.ceil(n_total / world_size)
+    start_idx = rank * n_per_rank
+    end_idx = min((rank + 1) * n_per_rank, n_total)
+    return seq_list_all_names[start_idx:end_idx] if start_idx < n_total else []
+
+def run_process_wrapper(rank, world_size, args):
+    device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available(): torch.cuda.set_device(rank)
+    
+    logger.info(f"Process {rank} started on device {device}")
+    model, tokenizer, processor = load_model_and_processor(args.model_path, device=device)
+    
+    all_sequence_names = [seq.name for seq in get_dataset(args.dataset_name)]
+    sequences_for_this_rank = [args.sequence] if args.sequence and rank == 0 else \
+                              split_sequences(all_sequence_names, rank, world_size) if not args.sequence else []
+
+    if not sequences_for_this_rank:
+        logger.info(f"Process {rank} has no sequences to process.")
+        return []
+
+    logger.info(f"Process {rank} will process sequences: {sequences_for_this_rank}")
+    
+    return evaluate_tracking_rft(
+        model, tokenizer, processor,
+        sequences_names=sequences_for_this_rank,
+        dataset_name=args.dataset_name,
+        save_visualize=args.save_vis,
+        output_dir=args.output_dir,
+        max_new_tokens=args.max_new_tokens,
+        rank=rank,
+        # smart_resize_factor is removed
+        smart_resize_min_pixels=args.smart_resize_min_pixels,
+        smart_resize_max_pixels=args.smart_resize_max_pixels,
+        gap_list=args.gap_list
+    )
+
+def main():
+    parser = argparse.ArgumentParser(description="RFT Model Single Object Tracking Inference (EasyR1 Style Processing)")
+    parser.add_argument("--model_path", type=str, required=True, help="Path to the fine-tuned RFT model")
+    parser.add_argument("--dataset_name", type=str, default="OTB_lang", help="Dataset name")
+    parser.add_argument("--sequence", type=str, default=None, help="Specific sequence name (optional)")
+    parser.add_argument("--output_dir", type=str, default="rft_tracking_results_easyr1_style", help="Output directory")
+    parser.add_argument("--save_vis", type=lambda x: (str(x).lower() == 'true'), default=False, help="Save visualizations (true/false)")
+    parser.add_argument("--max_new_tokens", type=int, default=100, help="Max new tokens for generation (reduced for tracking)") # Default was 2048
+    # parser.add_argument("--smart_resize_factor", type=int, default=DEFAULT_FACTOR, help="Factor for smart resize") # Removed
+    parser.add_argument("--smart_resize_min_pixels", type=int, default=DEFAULT_MIN_PIXELS, help="Min pixels for image processing (like EasyR1)")
+    parser.add_argument("--smart_resize_max_pixels", type=int, default=DEFAULT_MAX_PIXELS, help="Max pixels for image processing (like EasyR1)")
+    parser.add_argument("--gap_list", type=int, nargs='+', default=None, help="List of gaps for selecting template frames (e.g., --gap_list 1 5). If None, uses default [1, 5].")
+    parser.add_argument("--single_process", action="store_true", help="Force single process")
+    args = parser.parse_args()
+
+    if args.gap_list is None:
+        args.gap_list = [1, 5] 
+    logger.info(f"Using gap_list: {args.gap_list}")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    use_multiprocessing = torch.cuda.device_count() > 1 and not args.single_process
+    
+    if use_multiprocessing:
+        world_size = torch.cuda.device_count()
+        logger.info(f"Detected {world_size} GPUs, enabling multi-process evaluation.")
+        if mp.get_start_method(allow_none=True) != 'spawn': # Check before setting
+            try:
+                mp.set_start_method('spawn', force=True)
+            except RuntimeError as e:
+                logger.warning(f"Could not set start_method to 'spawn': {e}. Using default.")
+
+        with Pool(world_size) as pool:
+            func = functools.partial(run_process_wrapper, world_size=world_size, args=args)
+            results_list_of_lists = pool.map(func, range(world_size))
+        all_results_summary = [item for sublist in results_list_of_lists for item in sublist if sublist] # Ensure sublist is not None
+    else:
+        logger.info("Using single process evaluation.")
+        rank = 0
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        model, tokenizer, processor = load_model_and_processor(args.model_path, device=device)
+        all_sequence_names = [seq.name for seq in get_dataset(args.dataset_name)]
+        sequences_to_run = [args.sequence] if args.sequence else all_sequence_names
+        if not sequences_to_run:
+            logger.info("No sequences selected.")
+            return
+        all_results_summary = evaluate_tracking_rft(
+            model, tokenizer, processor, sequences_names=sequences_to_run,
+            dataset_name=args.dataset_name, save_visualize=args.save_vis,
+            output_dir=args.output_dir, max_new_tokens=args.max_new_tokens, rank=rank,
+            # smart_resize_factor is removed
+            smart_resize_min_pixels=args.smart_resize_min_pixels,
+            smart_resize_max_pixels=args.smart_resize_max_pixels,
+            gap_list=args.gap_list
+        )
+
+    if all_results_summary: # Check if there are any results
+        summary_file = os.path.join(args.output_dir, f"tracking_summary_{args.dataset_name}.json")
+        with open(summary_file, "w") as f:
+            json.dump(all_results_summary, f, indent=2)
+        logger.info(f"Overall tracking summary saved to {summary_file}")
+    else:
+        logger.info("No results to summarize.")
+
+if __name__ == "__main__":
+    main()
