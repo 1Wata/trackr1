@@ -50,9 +50,18 @@ def track_compute_score_not_think(predict_str: str, ground_truth: str, response_
         return {"overall": -1.0, "giou": 0.0}
 
     try: 
-        pre_bbox = json.loads(predict_str)
-        gt_bbox = json.loads(ground_truth)
-    except:
+        pre_bbox = json.loads(predict_str) # predict_str is like "[10,20,30,40]"
+        # ground_truth is like "10,20,30,40"
+        gt_coords_str = ground_truth.split(',')
+        if len(gt_coords_str) != 4:
+            # Handle error if ground_truth is not in "x,y,w,h" format after split
+            return {"overall": -1.0, "giou": 0.0}
+        gt_bbox = [int(c.strip()) for c in gt_coords_str]
+        
+        if len(pre_bbox) != 4: # Ensure pre_bbox also has 4 coordinates after json.loads
+            return {"overall": -1.0, "giou": 0.0}
+
+    except (json.JSONDecodeError, ValueError, TypeError): # Catch errors from json.loads, int conversion, or split
         return {"overall": -1.0, "giou": 0.0}
     
     try:
