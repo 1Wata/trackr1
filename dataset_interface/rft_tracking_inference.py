@@ -5,10 +5,10 @@ import argparse
 import logging
 # import time # Not used
 import torch
-# import numpy as np # Not used
+# import numpy as np # Not Used
 from PIL import Image, ImageDraw, ImageFile
 from tqdm import tqdm
-# import matplotlib.pyplot as plt # Not used
+# import matplotlib.pyplot as plt # Not Used
 from transformers import AutoProcessor, GenerationConfig
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer
 # sys.path.append( # Assuming evaluation.datasets is accessible or part of EasyR1 structure
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # These will now come from args: smart_resize_min_pixels, smart_resize_max_pixels
 # DEFAULT_FACTOR = 28 # No longer used
 DEFAULT_MIN_PIXELS = 3136  # Example, should match training if possible (56*56)
-DEFAULT_MAX_PIXELS = 102400 # Example, should match training if possible (320*320)
+DEFAULT_MAX_PIXELS = 409600 # Example, should match training if possible (320*320)
 
 
 # --- Tracking System Prompt (remains the same) ---
@@ -77,13 +77,95 @@ def convert_bbox_xyxy_to_xywh(bbox_xyxy):
     x1, y1, x2, y2 = bbox_xyxy
     return [x1, y1, x2 - x1, y2 - y1]
 
-def extract_single_bbox(response_text: str) -> Optional[List[int]]:
-    answer_match = re.search(r"<answer>(.*?)</answer>", response_text, re.DOTALL)
-    content = answer_match.group(1).strip() if answer_match else response_text.strip()
-    bbox_match = re.search(r"\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]", content)
-    if bbox_match:
-        return [int(coord) for coord in bbox_match.groups()]
-    logger.warning(f"Simplified: Failed to extract bounding box from response: {response_text}")
+
+
+def extract_single_bbox(response):
+    """
+    从模型响应中提取单个边界框，自动适应多种响应格式
+    
+    Args:
+        response (str): 模型的响应文本
+        
+    Returns:
+        list: 提取的边界框坐标 [x1, y1, x2, y2]，如果无法提取则返回 None
+    """
+    # 尝试从不同格式中提取内容
+    content_str = None
+    
+    # 检查是否有 thinking/answer 格式
+    thinking_start = "<thinking>"
+    thinking_end = "</thinking>"
+    answer_start = "<answer>"
+    answer_end = "</answer>"
+    
+    # 如果存在 thinking 和 answer 标签
+    if thinking_start in response and answer_start in response:
+        # 提取 answer 部分
+        start_idx = response.find(answer_start) + len(answer_start)
+        end_idx = response.find(answer_end) if answer_end in response else len(response)
+        content_str = response[start_idx:end_idx].strip()
+    
+    # 如果只有 answer 标签
+    elif answer_start in response:
+        start_idx = response.find(answer_start) + len(answer_start)
+        end_idx = response.find(answer_end) if answer_end in response else len(response)
+        content_str = response[start_idx:end_idx].strip()
+    
+    # 如果没有标签，则尝试直接提取
+    else:
+        content_str = response.strip()
+    
+    # 如果没有内容可提取
+    if not content_str:
+        return None
+    
+    # 替换单引号为双引号以兼容JSON格式
+    content_str = content_str.replace("'", '"')
+    
+    # 尝试解析为JSON格式
+    # 方法1: 直接的坐标列表 [x1, y1, x2, y2]
+    if content_str.startswith('[') and content_str.endswith(']'):
+        # 尝试解析为JSON数组
+        import json
+        
+        # 尝试解析整个内容
+        bbox_data = None
+        try:
+            bbox_data = json.loads(content_str)
+        except json.JSONDecodeError:
+            # 如果解析失败，继续尝试下一种方法
+            pass
+        
+        if bbox_data is not None:
+            # 检查是直接的坐标列表还是带有Position键的对象列表
+            if isinstance(bbox_data, list):
+                if len(bbox_data) == 4 and all(isinstance(x, (int, float)) for x in bbox_data):
+                    # 直接返回坐标列表 [x1, y1, x2, y2]
+                    return bbox_data
+                elif bbox_data and isinstance(bbox_data[0], dict) and 'Position' in bbox_data[0]:
+                    # 返回第一个边界框的Position
+                    return bbox_data[0]['Position']
+    
+    # 方法2: 尝试解析为字典形式 {'Position': [x1, y1, x2, y2]}
+    if content_str.startswith('{') and content_str.endswith('}'):
+        import json
+        
+        bbox_dict = None
+        try:
+            bbox_dict = json.loads(content_str)
+        except json.JSONDecodeError:
+            # 如果解析失败，继续尝试下一种方法
+            pass
+        
+        if bbox_dict is not None and isinstance(bbox_dict, dict) and 'Position' in bbox_dict:
+            return bbox_dict['Position']
+    
+    # 方法3: 使用正则表达式提取数字列表
+    import re
+    matches = re.findall(r'\[(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\]', content_str)
+    if matches:
+        return [int(x) for x in matches[0]]
+    
     return None
 # --- End Bbox Utils ---
 
@@ -319,19 +401,35 @@ def evaluate_tracking_rft(model, tokenizer, processor, sequences_names=None, dat
         gap_list = [1, 5] 
     logger.info(f"Process {rank} - Using gap_list: {gap_list}, min_pixels: {smart_resize_min_pixels}, max_pixels: {smart_resize_max_pixels}")
 
-    dataset = get_dataset(dataset_name)
+    full_dataset = get_dataset(dataset_name)
     results_summary = []
 
-    if sequences_names:
-        filtered_dataset_seqs = [dataset[seq_name] for seq_name in sequences_names if seq_name in dataset.seq_names]
-        if not filtered_dataset_seqs:
-            logger.warning(f"Process {rank} - No valid sequences found to process.")
-            return []
-        dataset = SequenceList(filtered_dataset_seqs)
-    
-    logger.info(f"Process {rank} - Processing {len(dataset)} sequences.")
+    sequences_to_process_for_this_rank = []
+    if sequences_names: # sequences_names is the list of sequence names for this rank
+        # Create a map of all sequence names to their objects from the full_dataset for efficient lookup
+        all_sequences_map = {seq.name: seq for seq in full_dataset}
+        for name in sequences_names:
+            if name in all_sequences_map:
+                sequences_to_process_for_this_rank.append(all_sequences_map[name])
+            else:
+                logger.warning(f"Process {rank} - Sequence name '{name}' assigned but not found in dataset '{dataset_name}'. Skipping.")
+        
+        if not sequences_to_process_for_this_rank:
+            logger.info(f"Process {rank} - No valid sequences to process after filtering by names: {sequences_names}.")
+            return [] # Return empty list if no sequences are left for this rank
+    elif rank == 0 and not sequences_names: # Likely single process mode, or args.sequence was None
+        sequences_to_process_for_this_rank = list(full_dataset) # Process all if no specific names given (typical for single process)
+        if not sequences_to_process_for_this_rank and dataset_name:
+             logger.info(f"Process {rank} - Dataset '{dataset_name}' is empty or no sequences were provided. Processing 0 sequences.")
+             return []
+    else: # sequences_names is empty or None, and not rank 0 in a way that implies "all"
+        logger.info(f"Process {rank} - No sequences assigned or dataset is empty. Processing 0 sequences.")
+        return []
 
-    for seq_idx, seq in enumerate(tqdm(dataset, desc=f"Process {rank} - Tracking progress")):
+    logger.info(f"Process {rank} - Will process {len(sequences_to_process_for_this_rank)} sequences: {[s.name for s in sequences_to_process_for_this_rank]}")
+
+    # The main loop should iterate over 'sequences_to_process_for_this_rank'
+    for seq_idx, seq in enumerate(tqdm(sequences_to_process_for_this_rank, desc=f"Process {rank} - Tracking progress")):
         seq_output_dir = os.path.join(output_dir, dataset_name, seq.name)
         os.makedirs(seq_output_dir, exist_ok=True)
         predictions_file_path = os.path.join(seq_output_dir, "predictions.txt")
@@ -536,12 +634,12 @@ def run_process_wrapper(rank, world_size, args):
 
 def main():
     parser = argparse.ArgumentParser(description="RFT Model Single Object Tracking Inference (EasyR1 Style Processing)")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to the fine-tuned RFT model")
+    parser.add_argument("--model_path", type=str, default='/data1/lihaobo/LLaMA-Factory/saves/Qwen2.5-VL-3B-Instruct/full/tracking_large-3', help="Path to the fine-tuned RFT model")
     parser.add_argument("--dataset_name", type=str, default="OTB_lang", help="Dataset name")
     parser.add_argument("--sequence", type=str, default=None, help="Specific sequence name (optional)")
     parser.add_argument("--output_dir", type=str, default="rft_tracking_results_easyr1_style", help="Output directory")
     parser.add_argument("--save_vis", type=lambda x: (str(x).lower() == 'true'), default=False, help="Save visualizations (true/false)")
-    parser.add_argument("--max_new_tokens", type=int, default=100, help="Max new tokens for generation")
+    parser.add_argument("--max_new_tokens", type=int, default=2048, help="Max new tokens for generation")
     parser.add_argument("--smart_resize_min_pixels", type=int, default=DEFAULT_MIN_PIXELS, help="Min pixels for image processing (like EasyR1)")
     parser.add_argument("--smart_resize_max_pixels", type=int, default=DEFAULT_MAX_PIXELS, help="Max pixels for image processing (like EasyR1)")
     parser.add_argument("--gap_list", type=int, nargs='+', default=None, help="List of gaps for selecting template frames (e.g., --gap_list 1 5). If None, uses default [1, 5].")

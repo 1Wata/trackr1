@@ -272,37 +272,73 @@ def build_one_turn_tracking_dataset(pytorch_dataset, output_dir="one_turn_tracki
 
             cropped_template_paths = []
             for t_idx, template_idx in enumerate(template_indices): 
+                current_original_bbox = template_bboxes_orig_selected[t_idx]  # 原始bbox [x1,y1,x2,y2]
+                current_jittered_bbox = template_bboxes_jittered_selected[t_idx] # 抖动后的bbox [x1,y1,x2,y2], 用于裁剪
+
                 cropped_template = crop_and_pad_template(
                     frame_paths[template_idx],
-                    template_bboxes_jittered_selected[t_idx], 
+                    current_jittered_bbox, # 使用抖动后的bbox进行裁剪
                     scale=scale,
                     resize=resize
                 )
-                template_filename = f"template_{template_idx:03d}_cropped.jpg" # 区分裁剪后的原图
+                template_filename = f"template_{template_idx:03d}_cropped.jpg" 
                 template_save_path = os.path.join(sample_dir, template_filename)
                 cropped_template.save(template_save_path)
                 
                 if draw_template_bbox:
-                    # 在裁剪后的图像上绘制红框
-                    # 边界框在裁剪后的图像中是居中的
-                    bbox_center_x, bbox_center_y = resize // 2, resize // 2
-                    # 假设目标在裁剪后占据 1/scale 的区域
-                    bbox_width_on_cropped = int(resize / scale) 
-                    bbox_height_on_cropped = int(resize / scale) # 假设正方形目标区域
+                    path_to_add_to_list = template_save_path # 默认使用未画框的图
+
+                    # 从抖动框计算裁剪区域的原始图像坐标
+                    x1_j, y1_j, x2_j, y2_j = current_jittered_bbox
+                    w_j = x2_j - x1_j
+                    h_j = y2_j - y1_j
+
+                    if w_j > 0 and h_j > 0: # 确保抖动框有效
+                        center_x_j = (x1_j + x2_j) / 2
+                        center_y_j = (y1_j + y2_j) / 2
+                        
+                        # 计算实际裁剪区域在原图中的尺寸 (基于抖动框和scale)
+                        crop_width_in_orig_img = w_j * scale
+                        crop_height_in_orig_img = h_j * scale
+
+                        if crop_width_in_orig_img > 0 and crop_height_in_orig_img > 0:
+                            # 计算实际裁剪区域在原图中的左上角坐标
+                            crop_region_x1_in_orig_img = center_x_j - crop_width_in_orig_img / 2
+                            crop_region_y1_in_orig_img = center_y_j - crop_height_in_orig_img / 2
+
+                            # 获取原始目标框的坐标
+                            x1_o, y1_o, x2_o, y2_o = current_original_bbox
+
+                            # 计算原始目标框相对于裁剪区域左上角的坐标
+                            relative_x1_o = x1_o - crop_region_x1_in_orig_img
+                            relative_y1_o = y1_o - crop_region_y1_in_orig_img
+                            relative_x2_o = x2_o - crop_region_x1_in_orig_img
+                            relative_y2_o = y2_o - crop_region_y1_in_orig_img
+
+                            # 计算缩放比例 (从原图裁剪区域到resize后的图像)
+                            scale_factor_x = resize / crop_width_in_orig_img
+                            scale_factor_y = resize / crop_height_in_orig_img
+
+                            # 计算原始目标框在resize后的图像中的最终坐标
+                            final_draw_x1 = relative_x1_o * scale_factor_x
+                            final_draw_y1 = relative_y1_o * scale_factor_y
+                            final_draw_x2 = relative_x2_o * scale_factor_x
+                            final_draw_y2 = relative_y2_o * scale_factor_y
+                            
+                            bbox_to_draw = [int(final_draw_x1), int(final_draw_y1), int(final_draw_x2), int(final_draw_y2)]
+                            
+                            # 定义带红框图像的保存路径
+                            template_with_bbox_filename = f"template_{template_idx:03d}_with_bbox.jpg"
+                            template_with_bbox_path = os.path.join(sample_dir, template_with_bbox_filename)
+                            
+                            # 绘制红框
+                            path_to_add_to_list = draw_red_bbox_on_image(template_save_path, bbox_to_draw, template_with_bbox_path)
+                        else:
+                            print(f"Warning: Sample {i}, Template {template_idx}: Crop dimensions for drawing bbox are invalid (w={crop_width_in_orig_img}, h={crop_height_in_orig_img}). Using unannotated template.")
+                    else:
+                        print(f"Warning: Sample {i}, Template {template_idx}: Jittered bbox for crop context is invalid (w={w_j}, h={h_j}). Using unannotated template.")
                     
-                    x1 = bbox_center_x - bbox_width_on_cropped // 2
-                    y1 = bbox_center_y - bbox_height_on_cropped // 2
-                    x2 = x1 + bbox_width_on_cropped
-                    y2 = y1 + bbox_height_on_cropped
-                    centered_bbox_on_cropped = [x1, y1, x2, y2]
-                    
-                    # 为带红框的图像创建新路径
-                    template_with_bbox_filename = f"template_{template_idx:03d}_with_bbox.jpg"
-                    template_with_bbox_path = os.path.join(sample_dir, template_with_bbox_filename)
-                    
-                    # 绘制红框
-                    new_path = draw_red_bbox_on_image(template_save_path, centered_bbox_on_cropped, template_with_bbox_path)
-                    cropped_template_paths.append(new_path) # 添加带红框的图像路径
+                    cropped_template_paths.append(path_to_add_to_list)
                 else:
                     cropped_template_paths.append(template_save_path) # 不绘制红框，使用裁剪后的原图路径
 
