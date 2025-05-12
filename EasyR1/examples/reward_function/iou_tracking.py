@@ -72,7 +72,7 @@ def calculate_giou(box1, box2):
     return giou
 
 
-def compute_score(predict_str: str, ground_truth: str, format_weight: float = 0.1) -> Dict[str, float]:
+def compute_score(predict_str: str, ground_truth: list, format_weight: float = 0.1) -> Dict[str, float]:
     if not predict_str or not ground_truth:
         return {"overall": 0.0, "giou": 0.0, "format_score": 0.0}  # 修改为0.0
 
@@ -90,12 +90,13 @@ def compute_score(predict_str: str, ground_truth: str, format_weight: float = 0.
     try:
         # Attempt to parse the (potentially extracted) predict_str_for_giou
         pre_bbox = json.loads(predict_str_for_giou)
-        # ground_truth is like "10,20,30,40"
-        gt_coords_str = ground_truth.split(',')
-        if len(gt_coords_str) != 4:
-            # Handle error if ground_truth is not in "x,y,w,h" format after split
+        
+        # 修改: ground_truth已经是一个list，直接使用
+        if not isinstance(ground_truth, list) or len(ground_truth) != 4:
+            # Handle error if ground_truth is not a list with 4 elements
             return {"overall": 0.0 * (1-format_weight) + (format_score * format_weight), "giou": 0.0, "format_score": format_score}  # 使用format_weight
-        gt_bbox = [int(c.strip()) for c in gt_coords_str]
+        
+        gt_bbox = ground_truth  # 直接使用ground_truth作为gt_bbox
         
         if len(pre_bbox) != 4: # Ensure pre_bbox also has 4 coordinates after json.loads
             return {"overall": 0.0 * (1-format_weight) + (format_score * format_weight), "giou": 0.0, "format_score": format_score}  # 使用format_weight

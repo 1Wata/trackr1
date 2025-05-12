@@ -1,6 +1,6 @@
 import os
 import argparse
-from PIL import Image
+from PIL import Image, ImageDraw
 import json
 from tqdm import tqdm
 import random
@@ -34,8 +34,43 @@ def normalize_and_scale_bbox_abs(bbox_abs, img_w, img_h):
     ]
 
 
+def draw_red_bbox_on_image(image_path, bbox, output_path=None, line_width=3):
+    """
+    在图像上绘制红色边界框 (简化版，仅使用PIL)。
+    Args:
+        image_path: 原始图像路径
+        bbox: 边界框坐标 [x1, y1, x2, y2]
+        output_path: 输出图像路径。如果为None，则基于原路径生成新名或覆盖（取决于后续逻辑）
+        line_width: 边界框线宽
+    Returns:
+        输出图像的路径
+    """
+    if output_path is None:
+        # 如果未提供输出路径，可以设计一个默认行为，例如在原文件名后添加 "_bbox"
+        # 为简单起见，这里我们假设如果 output_path 为 None，则覆盖原图，
+        # 但在实际调用时，我们总是会提供一个明确的 output_path。
+        output_path = image_path
+            
+    img = Image.open(image_path)
+    # 确保图像是 RGB 模式，以支持彩色绘制
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+        
+    draw = ImageDraw.Draw(img)
+    
+    # 绘制红色边界框
+    # Pillow 的 rectangle 方法接受 [(x0, y0), (x1, y1)]
+    draw.rectangle(
+        [(bbox[0], bbox[1]), (bbox[2], bbox[3])],
+        outline="red",  # Pillow 可以直接使用颜色名称字符串
+        width=line_width
+    )
+    
+    img.save(output_path)
+    return output_path
+
 def build_one_turn_tracking_dataset(pytorch_dataset, output_dir="one_turn_tracking_dataset_cropped",
-                                    template_frames=1, scale=2.0, search_scale=4.0, resize=320, no_crop=False, normalize_bbox=False, output_format="hf"):
+                                    template_frames=1, scale=2.0, search_scale=4.0, resize=320, no_crop=False, normalize_bbox=False, output_format="hf", draw_template_bbox=True):
     """
     构建一个跟踪数据集，可选是否使用裁剪图像。
     
@@ -49,6 +84,7 @@ def build_one_turn_tracking_dataset(pytorch_dataset, output_dir="one_turn_tracki
         no_crop: 是否不裁剪图像，直接使用原始图像路径
         normalize_bbox: 是否对边界框进行归一化 (乘以1000并取整)
         output_format: 输出数据集的格式 ("hf" 或 "parquet")
+        draw_template_bbox: 是否在模板图像上绘制边界框 (默认为 True)
     """
     # 创建输出目录
     os.makedirs(output_dir, exist_ok=True)
@@ -65,7 +101,7 @@ def build_one_turn_tracking_dataset(pytorch_dataset, output_dir="one_turn_tracki
     processed_count = 0
     
     # 根据 normalize_bbox 参数确定实际使用的系统提示
-    current_tracking_system_prompt = get_tracking_system_prompt(use_thinking=False, normalize_bbox_for_system_prompt=normalize_bbox)
+    # current_tracking_system_prompt = get_tracking_system_prompt(use_thinking=False, normalize_bbox_for_system_prompt=normalize_bbox) # Removed
     
     # 确定要处理的样本数量
     if hasattr(pytorch_dataset, 'samples_per_epoch') and pytorch_dataset.samples_per_epoch is not None:
@@ -153,8 +189,35 @@ def build_one_turn_tracking_dataset(pytorch_dataset, output_dir="one_turn_tracki
 
             search_indices = list(range(len(template_frame_paths), num_frames))
 
-            # 使用原始模板帧路径
-            cropped_template_paths = [template_frame_paths[idx] for idx in template_indices]
+            # 为 no_crop 模式下带红框的图像创建样本特定子目录
+            sample_bbox_images_dir = os.path.join(output_dir, f"{i:06d}")
+            os.makedirs(sample_bbox_images_dir, exist_ok=True)
+
+            # 使用原始模板帧路径，但添加红框
+            cropped_template_paths = []
+            for t_idx, template_idx in enumerate(template_indices):
+                original_path = template_frame_paths[template_idx]
+                if draw_template_bbox:
+                    bbox_raw_list = template_anno_dict.get('bbox', [])
+                    if template_idx < len(bbox_raw_list):
+                        bbox_raw = bbox_raw_list[template_idx]
+                        if isinstance(bbox_raw, torch.Tensor):
+                            bbox_raw = bbox_raw.tolist()
+                        template_bbox_abs = convert_bbox_format(bbox_raw)
+                        
+                        # 为带红框的图像创建新路径
+                        base_name = os.path.basename(original_path)
+                        name, ext = os.path.splitext(base_name)
+                        # 将带红框的图像保存到样本特定子目录中
+                        template_with_bbox_path = os.path.join(sample_bbox_images_dir, f"template_{template_idx}{ext}")
+                        
+                        # 绘制红框
+                        new_path = draw_red_bbox_on_image(original_path, template_bbox_abs, template_with_bbox_path)
+                        cropped_template_paths.append(new_path)
+                    else:
+                        cropped_template_paths.append(original_path) # 无bbox信息则使用原图
+                else:
+                    cropped_template_paths.append(original_path) # 不绘制红框，使用原图
 
             # 使用原始搜索帧路径
             cropped_search_paths = [frame_paths[idx] for idx in search_indices]
@@ -208,17 +271,40 @@ def build_one_turn_tracking_dataset(pytorch_dataset, output_dir="one_turn_tracki
             template_bboxes_jittered_selected = [jitter_bbox(bbox, jitter_scale=0.05) for bbox in template_bboxes_orig_selected]
 
             cropped_template_paths = []
-            for t_idx, template_idx in enumerate(template_indices): # Iterate using selected indices
+            for t_idx, template_idx in enumerate(template_indices): 
                 cropped_template = crop_and_pad_template(
                     frame_paths[template_idx],
-                    template_bboxes_jittered_selected[t_idx], # Use corresponding jittered bbox
+                    template_bboxes_jittered_selected[t_idx], 
                     scale=scale,
                     resize=resize
                 )
-                template_filename = f"template_{template_idx:03d}.jpg" # Use original index for filename
+                template_filename = f"template_{template_idx:03d}_cropped.jpg" # 区分裁剪后的原图
                 template_save_path = os.path.join(sample_dir, template_filename)
                 cropped_template.save(template_save_path)
-                cropped_template_paths.append(template_save_path)
+                
+                if draw_template_bbox:
+                    # 在裁剪后的图像上绘制红框
+                    # 边界框在裁剪后的图像中是居中的
+                    bbox_center_x, bbox_center_y = resize // 2, resize // 2
+                    # 假设目标在裁剪后占据 1/scale 的区域
+                    bbox_width_on_cropped = int(resize / scale) 
+                    bbox_height_on_cropped = int(resize / scale) # 假设正方形目标区域
+                    
+                    x1 = bbox_center_x - bbox_width_on_cropped // 2
+                    y1 = bbox_center_y - bbox_height_on_cropped // 2
+                    x2 = x1 + bbox_width_on_cropped
+                    y2 = y1 + bbox_height_on_cropped
+                    centered_bbox_on_cropped = [x1, y1, x2, y2]
+                    
+                    # 为带红框的图像创建新路径
+                    template_with_bbox_filename = f"template_{template_idx:03d}_with_bbox.jpg"
+                    template_with_bbox_path = os.path.join(sample_dir, template_with_bbox_filename)
+                    
+                    # 绘制红框
+                    new_path = draw_red_bbox_on_image_simplified(template_save_path, centered_bbox_on_cropped, template_with_bbox_path)
+                    cropped_template_paths.append(new_path) # 添加带红框的图像路径
+                else:
+                    cropped_template_paths.append(template_save_path) # 不绘制红框，使用裁剪后的原图路径
 
             # --- 处理所有搜索帧 (除了模板帧) ---
             # Search indices start after all *original* template frames
@@ -272,11 +358,15 @@ def build_one_turn_tracking_dataset(pytorch_dataset, output_dir="one_turn_tracki
         # 构建用户提示
         init_user_content = []
 
-        # 添加模板帧
+        # 1. 初始指令
+        init_user_content.append({"text": "You are a professional visual object tracking assistant. Your task is to track a specified target object. First, identify the target in the template frames. These frames may include a red bounding box highlighting the target."})
+
+        # 2. 添加模板帧图像
         for _ in range(len(cropped_template_paths)):
             init_user_content.append({"type": "image"})
 
 
+        # 3. 添加模板帧的边界框信息 (如果 no_crop)
         for idx, template_original_idx in enumerate(template_indices):
             if no_crop:
                 # 原始坐标系下的bbox
@@ -287,7 +377,7 @@ def build_one_turn_tracking_dataset(pytorch_dataset, output_dir="one_turn_tracki
                         bbox_raw = bbox_raw.tolist()
                     template_bbox_abs = convert_bbox_format(bbox_raw)  # 转换为 [x1, y1, x2, y2] 格式
                     
-                    if template_bbox_abs:
+                    if template_bbox_abs: # 仅当bbox有效时添加文本
                         if normalize_bbox:
                             if template_original_idx < len(all_frame_dims):
                                 img_w, img_h = all_frame_dims[template_original_idx]
@@ -304,29 +394,39 @@ def build_one_turn_tracking_dataset(pytorch_dataset, output_dir="one_turn_tracki
             else:
                 # 裁剪模式下不需要添加，因为已经通过裁剪图像隐式传达了目标位置
                 pass
-        # 描述物体
-        template_text = f"\nThese are the template frames showing the object '{exp_str}'."
-        init_user_content.append({"text": template_text})
+        
+        # 4. 描述物体
+        init_user_content.append({"text": f"\nThese are the template frames showing the object '{exp_str}'."})
 
-        # 添加所有搜索帧
+        # 5. 搜索帧指令
+        init_user_content.append({"text": "Now, locate the target's position in the following search frames."})
+
+
+        # 6. 添加所有搜索帧图像
         for _ in range(len(cropped_search_paths)):
             init_user_content.append({"type": "image"})
 
-        # 添加跟踪指令，根据搜索帧数量调整语言
-        tracking_instruction = f" Please track the object '{exp_str}' in "
+        # 7. 跟踪、格式化指令和分析要求
+        tracking_instruction_base = f"Please track the object '{exp_str}' in "
         if len(cropped_search_paths) > 1:
-            tracking_instruction += f"these {len(cropped_search_paths)} search frames. "
-            tracking_instruction += f"For each of the {len(cropped_search_paths)} frames, provide a separate bounding box. "
+            tracking_instruction_base += f"these {len(cropped_search_paths)} search frames."
         else:
-            tracking_instruction += "the next frame. "
-            tracking_instruction += "Provide a bounding box for the last frame. "
+            tracking_instruction_base += "the next frame."
         
+        bbox_format_text = ""
         if normalize_bbox:
-            tracking_instruction += "The bounding box should be in normalized [x1, y1, x2, y2] format, where coordinates are integers scaled to the range [0, 1000]. "
+            bbox_format_text = "The bounding box should be in normalized [x1, y1, x2, y2] format, where coordinates are integers scaled to the range [0, 1000]."
         else:
-            tracking_instruction += "The bounding box should be in [x1, y1, x2, y2] format with absolute pixel coordinates. "
-        # tracking_instruction += "Wrap each answer in <answer></answer> tags."
-        init_user_content.append({"text": tracking_instruction})
+            bbox_format_text = "The bounding box should be in [x1, y1, x2, y2] format with absolute pixel coordinates."
+        
+        final_instruction_text = (
+            f"{tracking_instruction_base} {bbox_format_text} "
+            "Before providing the bounding box for search frame, first analyze the visual characteristics of the object highlighted by the red bounding box in the template image(s). "
+            "Then, use this understanding to track the object in the search frame(s). "
+            "Provide your final answer for search frame wrapped in <answer>[x1, y1, x2, y2]</answer> tags."
+        )
+        init_user_content.append({"text": final_instruction_text})
+
 
         init_user_msg = {"role": "user", "content": init_user_content}
         prompt_messages = [init_user_msg]
@@ -375,7 +475,7 @@ def build_one_turn_tracking_dataset(pytorch_dataset, output_dir="one_turn_tracki
         # 创建样本
         sample_data = {
             "image": image_paths_for_sample,
-            "problem": current_tracking_system_prompt,
+            "problem": "", # 系统提示已移至用户提示
             "solution": solution,
             "prompt": prompt_messages
         }
@@ -437,33 +537,35 @@ def build_one_turn_tracking_dataset(pytorch_dataset, output_dir="one_turn_tracki
     print("-" * 30)
     
     return hf_dataset_to_return # 返回hf_dataset（如果创建了），否则返回None
-def get_tracking_system_prompt(use_thinking=False, normalize_bbox_for_system_prompt=False):
-    """获取追踪任务的系统提示"""
-    base_prompt = (
-        "You are a professional visual object tracking assistant. Your task is to track a specified target object. "
-        "The user will provide template frames showing the target object. "
-        "First, identify the target in the template frames. Then, locate the target's position in the following search frames."
-    )
+
+# Removed get_tracking_system_prompt function and TRACKING_SYSTEM_PROMPT global variable
+# def get_tracking_system_prompt(use_thinking=False, normalize_bbox_for_system_prompt=False):
+#     """获取追踪任务的系统提示"""
+#     base_prompt = (
+#         "You are a professional visual object tracking assistant. Your task is to track a specified target object. "
+#         "The user will provide template frames showing the target object. "
+#         "First, identify the target in the template frames. Then, locate the target's position in the following search frames."
+#     )
     
-    bbox_format_instruction = "the target's bounding box coordinates in the format [x1, y1, x2, y2], where (x1, y1) is the top-left coordinate and (x2, y2) is the bottom-right coordinate."
-    if normalize_bbox_for_system_prompt:
-        bbox_format_instruction = "the target's bounding box coordinates in normalized [x1, y1, x2, y2] format, where coordinates are integers scaled to the range [0, 1000]."
+#     bbox_format_instruction = "the target's bounding box coordinates in the format [x1, y1, x2, y2], where (x1, y1) is the top-left coordinate and (x2, y2) is the bottom-right coordinate."
+#     if normalize_bbox_for_system_prompt:
+#         bbox_format_instruction = "the target's bounding box coordinates in normalized [x1, y1, x2, y2] format, where coordinates are integers scaled to the range [0, 1000]."
     
-    if use_thinking:
-        return base_prompt + (
-            " You should first think about how to locate the target by analyzing visual features, then provide your answer. "
-            "Put your thinking process inside <thinking>...</thinking> tags. "
-            f"Your final answer should be {bbox_format_instruction} "
-            "Wrap your final answer in <answer>[x1, y1, x2, y2]</answer> tags."
-        )
-    else:
-        return base_prompt + (
-            f" Please directly return {bbox_format_instruction} "
-            "Your answer should be wrapped in <answer>[x1, y1, x2, y2]</answer> tags."
-        )
+#     if use_thinking:
+#         return base_prompt + (
+#             " You should first think about how to locate the target by analyzing visual features, then provide your answer. "
+#             "Put your thinking process inside <thinking>...</thinking> tags. "
+#             f"Your final answer should be {bbox_format_instruction} "
+#             "Wrap your final answer in <answer>[x1, y1, x2, y2]</answer> tags."
+#         )
+#     else:
+#         return base_prompt + (
+#             f" Please directly return {bbox_format_instruction} "
+#             "Your answer should be wrapped in <answer>[x1, y1, x2, y2]</answer> tags."
+#         )
 
 
-TRACKING_SYSTEM_PROMPT = get_tracking_system_prompt(False)
+# TRACKING_SYSTEM_PROMPT = get_tracking_system_prompt(False) # Removed
 
 if __name__ == "__main__":
     # 创建参数解析器
@@ -483,6 +585,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_crop", default=True, help="是否不裁剪图像，直接使用原始图像路径")
     parser.add_argument("--normalize_bbox", default=False, help="是否使用归一化的边界框。如果是，坐标将被归一化并乘以1000取整。")
     parser.add_argument("--output_format", type=str, default="json", choices=["hf", "json"], help="输出数据集的格式: 'hf' (Hugging Face Datasets) 或 'json' (JSON)")
+    parser.add_argument("--no_draw_template_bbox", action="store_true", help="不在模板图像上绘制红色边界框。")
     
     # 解析命令行参数
     args = parser.parse_args()
@@ -524,7 +627,8 @@ if __name__ == "__main__":
         resize=args.resize,
         no_crop=args.no_crop,
         normalize_bbox=args.normalize_bbox,
-        output_format=args.output_format # 传递 output_format 参数
+        output_format=args.output_format, # 传递 output_format 参数
+        draw_template_bbox=not args.no_draw_template_bbox # 传递是否绘制模板框的参数
     )
 
 
@@ -552,3 +656,5 @@ if __name__ == "__main__":
 
     else:
         print(f"Unsupported output format for verification: {args.output_format}")
+
+
