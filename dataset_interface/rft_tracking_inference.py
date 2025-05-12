@@ -430,10 +430,23 @@ def evaluate_tracking_rft(model, tokenizer, processor, sequences_names=None, dat
 
     # The main loop should iterate over 'sequences_to_process_for_this_rank'
     for seq_idx, seq in enumerate(tqdm(sequences_to_process_for_this_rank, desc=f"Process {rank} - Tracking progress")):
-        seq_output_dir = os.path.join(output_dir, dataset_name, seq.name)
-        os.makedirs(seq_output_dir, exist_ok=True)
-        predictions_file_path = os.path.join(seq_output_dir, "predictions.txt")
+        # OLD path construction:
+        # seq_output_dir = os.path.join(output_dir, dataset_name, seq.name)
+        # os.makedirs(seq_output_dir, exist_ok=True)
+        # predictions_file_path = os.path.join(seq_output_dir, "predictions.txt")
+
+        # NEW path construction for analysis script compatibility:
+        dataset_results_dir = os.path.join(output_dir, dataset_name)
+        os.makedirs(dataset_results_dir, exist_ok=True)
+        predictions_file_path = os.path.join(dataset_results_dir, f"{seq.name}.txt")
         
+        # Visualization saving path needs adjustment if you want to keep them.
+        # Option: Save visualizations in a separate structure or a subfolder.
+        # For example, a subfolder within dataset_results_dir named after the sequence for visualizations:
+        vis_output_dir_for_seq = os.path.join(dataset_results_dir, seq.name + "_visuals")
+        if save_visualize:
+            os.makedirs(vis_output_dir_for_seq, exist_ok=True)
+
         all_history_frame_paths: List[Optional[str]] = [] 
         all_history_bboxes_orig_xyxy: List[Optional[List[int]]] = [] 
 
@@ -472,7 +485,8 @@ def evaluate_tracking_rft(model, tokenizer, processor, sequences_names=None, dat
 
         if save_visualize: 
             img_draw = draw_bbox_on_image(first_frame_pil_orig, first_frame_gt_bbox_original_xyxy)
-            img_draw.save(os.path.join(seq_output_dir, f"frame_0000_gt.jpg"))
+            # OLD: img_draw.save(os.path.join(seq_output_dir, f"frame_0000_gt.jpg"))
+            img_draw.save(os.path.join(vis_output_dir_for_seq, f"frame_0000_gt.jpg")) # NEW if using vis_output_dir_for_seq
 
         with open(predictions_file_path, "w") as f:
             f.write(f"{first_frame_gt_bbox_xywh[0]},{first_frame_gt_bbox_xywh[1]},{first_frame_gt_bbox_xywh[2]},{first_frame_gt_bbox_xywh[3]}\n")
@@ -582,7 +596,8 @@ def evaluate_tracking_rft(model, tokenizer, processor, sequences_names=None, dat
 
             if save_visualize: 
                 img_draw = draw_bbox_on_image(search_pil_orig, pred_bbox_original_xyxy_for_history)
-                img_draw.save(os.path.join(seq_output_dir, f"frame_{i:04d}_pred.jpg"))
+                # OLD: img_draw.save(os.path.join(seq_output_dir, f"frame_{i:04d}_pred.jpg"))
+                img_draw.save(os.path.join(vis_output_dir_for_seq, f"frame_{i:04d}_pred.jpg")) # NEW if using vis_output_dir_for_seq
 
             all_history_frame_paths, all_history_bboxes_orig_xyxy = update_history_indexed(
                 all_history_frame_paths, all_history_bboxes_orig_xyxy,
