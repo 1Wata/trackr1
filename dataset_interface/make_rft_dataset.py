@@ -301,7 +301,7 @@ def build_one_turn_tracking_dataset(pytorch_dataset, output_dir="one_turn_tracki
                     template_with_bbox_path = os.path.join(sample_dir, template_with_bbox_filename)
                     
                     # 绘制红框
-                    new_path = draw_red_bbox_on_image_simplified(template_save_path, centered_bbox_on_cropped, template_with_bbox_path)
+                    new_path = draw_red_bbox_on_image(template_save_path, centered_bbox_on_cropped, template_with_bbox_path)
                     cropped_template_paths.append(new_path) # 添加带红框的图像路径
                 else:
                     cropped_template_paths.append(template_save_path) # 不绘制红框，使用裁剪后的原图路径
