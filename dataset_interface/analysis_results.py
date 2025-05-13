@@ -96,6 +96,20 @@ def evaluate_direct(results_path, dataset_name):
         print(f"\nEvaluation summary saved to: {summary_txt_file_path}")
 
 
+
+def fix_dir(dir_path):
+    for sub_dir_name in os.listdir(dir_path):
+        sub_dir_path = os.path.join(dir_path, sub_dir_name)
+        if os.path.isdir(sub_dir_path):
+            predictions_file_path = os.path.join(sub_dir_path, "predictions.txt")
+            if os.path.exists(predictions_file_path):
+                new_file_name = f"{sub_dir_name}.txt"
+                new_file_path = os.path.join(dir_path, new_file_name)
+
+                os.rename(predictions_file_path, new_file_path)
+                print(f"Renamed: {predictions_file_path} to {new_file_path}")
+
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='Evaluate tracking results directly from prediction files.')
@@ -103,7 +117,7 @@ if __name__ == "__main__":
     parser.add_argument('dataset_name', type=str, help='Name of the dataset to evaluate on.')
     
     args = parser.parse_args()
-    
+    fix_dir(args.results_path)  # 修复目录结构
     my_results_path = args.results_path
     my_dataset_name = args.dataset_name
     
