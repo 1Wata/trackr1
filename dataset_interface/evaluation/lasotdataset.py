@@ -1,6 +1,6 @@
 import numpy as np
-from lib.test.evaluation.data import Sequence, BaseDataset, SequenceList
-from lib.test.utils.load_text import load_text
+from evaluation.data import Sequence, BaseDataset, SequenceList
+from evaluation.utils.load_text import load_text
 
 
 class LaSOTDataset(BaseDataset):

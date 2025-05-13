@@ -14,6 +14,8 @@ def local_env_settings():
     settings.nfs_path = ''
     settings.otb_path = ''
     settings.otb_lang_path = '/data1/lihaobo/tracking/data/OTB_lang'
+    settings.tnl2k_path = '/data1/lihaobo/tracking/data/TNL2K_CVPR2021'
+    settings.lasot_path = '/data1/lihaobo/tracking/data/lasot'
     settings.result_plot_path = '/data1/lihaobo/tracking/dataset_interface/result_plots/'
     settings.results_path = '/data1/lihaobo/tracking/dataset_interface/tracking_results/'    # Where to store tracking results
     settings.tn_packed_results_path = ''

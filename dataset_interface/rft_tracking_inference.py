@@ -27,7 +27,7 @@ import multiprocessing as mp
 from multiprocessing import Pool
 import math
 from typing import List, Optional, Tuple
-
+from analysis_results import evaluate_direct
 ImageFile.LOAD_TRUNCATED_IMAGES = True # Helpful for some datasets
 
 # Setup logging
@@ -617,27 +617,37 @@ def split_sequences(seq_list_all_names, rank, world_size):
     end_idx = min((rank + 1) * n_per_rank, n_total)
     return seq_list_all_names[start_idx:end_idx] if start_idx < n_total else []
 
-def run_process_wrapper(rank, world_size, args):
+def run_process_wrapper(rank, world_size, args, current_dataset_name_for_wrapper):
     device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
     if torch.cuda.is_available(): torch.cuda.set_device(rank)
     
-    logger.info(f"Process {rank} started on device {device}")
+    logger.info(f"Process {rank} started on device {device} for dataset {current_dataset_name_for_wrapper}")
     model, tokenizer, processor = load_model_and_processor(args.model_path, device=device)
     
-    all_sequence_names = [seq.name for seq in get_dataset(args.dataset_name)]
-    sequences_for_this_rank = [args.sequence] if args.sequence and rank == 0 else \
-                              split_sequences(all_sequence_names, rank, world_size) if not args.sequence else []
+    all_sequence_names_for_current_dataset = [seq.name for seq in get_dataset(current_dataset_name_for_wrapper)]
+
+    if args.sequence:
+        if rank == 0: # Only rank 0 handles the specific sequence if provided
+            sequences_for_this_rank = [args.sequence]
+            # Check if the sequence exists in the current dataset
+            if args.sequence not in all_sequence_names_for_current_dataset:
+                logger.warning(f"Process {rank} - Sequence '{args.sequence}' not found in dataset '{current_dataset_name_for_wrapper}'. This rank will process no sequences for this dataset.")
+                sequences_for_this_rank = []
+        else:
+            sequences_for_this_rank = [] # Other ranks do nothing if a specific sequence is requested
+    else:
+        sequences_for_this_rank = split_sequences(all_sequence_names_for_current_dataset, rank, world_size)
 
     if not sequences_for_this_rank:
-        logger.info(f"Process {rank} has no sequences to process.")
+        logger.info(f"Process {rank} has no sequences to process for dataset {current_dataset_name_for_wrapper}.")
         return []
 
-    logger.info(f"Process {rank} will process sequences: {sequences_for_this_rank}")
+    logger.info(f"Process {rank} will process sequences: {sequences_for_this_rank} for dataset {current_dataset_name_for_wrapper}")
     
     return evaluate_tracking_rft(
         model, tokenizer, processor,
         sequences_names=sequences_for_this_rank,
-        dataset_name=args.dataset_name,
+        dataset_name=current_dataset_name_for_wrapper,
         save_visualize=args.save_vis,
         output_dir=args.output_dir,
         max_new_tokens=args.max_new_tokens,
@@ -650,14 +660,14 @@ def run_process_wrapper(rank, world_size, args):
 def main():
     parser = argparse.ArgumentParser(description="RFT Model Single Object Tracking Inference (EasyR1 Style Processing)")
     parser.add_argument("--model_path", type=str, default='/data1/lihaobo/LLaMA-Factory/saves/Qwen2.5-VL-3B-Instruct/full/tracking_large-3', help="Path to the fine-tuned RFT model")
-    parser.add_argument("--dataset_name", type=str, default="OTB_lang", help="Dataset name")
-    parser.add_argument("--sequence", type=str, default=None, help="Specific sequence name (optional)")
+    parser.add_argument("--dataset_name", type=str, nargs='+', default=["lasot", "TNL2k", "OTB_lang"], help="Dataset name(s), e.g., lasot TNL2k OTB_lang")
+    parser.add_argument("--sequence", type=str, default=None, help="Specific sequence name (optional, will be attempted for each dataset)")
     parser.add_argument("--output_dir", type=str, default="rft_tracking_results_easyr1_style", help="Output directory")
     parser.add_argument("--save_vis", type=lambda x: (str(x).lower() == 'true'), default=False, help="Save visualizations (true/false)")
     parser.add_argument("--max_new_tokens", type=int, default=2048, help="Max new tokens for generation")
     parser.add_argument("--smart_resize_min_pixels", type=int, default=DEFAULT_MIN_PIXELS, help="Min pixels for image processing (like EasyR1)")
     parser.add_argument("--smart_resize_max_pixels", type=int, default=DEFAULT_MAX_PIXELS, help="Max pixels for image processing (like EasyR1)")
-    parser.add_argument("--gap_list", type=int, nargs='+', default=None, help="List of gaps for selecting template frames (e.g., --gap_list 1 5). If None, uses default [1, 5].")
+    parser.add_argument("--gap_list", type=int, nargs='+', default=None, help="List of gaps for selecting template frames (e.g., --gap_list 1 5). If None, uses default [1, 10].")
     parser.add_argument("--single_process", action="store_true", help="Force single process")
     args = parser.parse_args()
 
@@ -666,47 +676,64 @@ def main():
     logger.info(f"Using gap_list: {args.gap_list}")
 
     os.makedirs(args.output_dir, exist_ok=True)
-    use_multiprocessing = torch.cuda.device_count() > 1 and not args.single_process
     
-    if use_multiprocessing:
-        world_size = torch.cuda.device_count()
-        logger.info(f"Detected {world_size} GPUs, enabling multi-process evaluation.")
-        if mp.get_start_method(allow_none=True) != 'spawn': 
-            try:
+    for current_dataset_name in args.dataset_name:
+        logger.info(f"Processing dataset: {current_dataset_name}")
+        
+        use_multiprocessing = torch.cuda.device_count() > 1 and not args.single_process
+        current_dataset_summary = []
+
+        if use_multiprocessing:
+            world_size = torch.cuda.device_count()
+            logger.info(f"Detected {world_size} GPUs, enabling multi-process evaluation for dataset {current_dataset_name}.")
+            if mp.get_start_method(allow_none=True) != 'spawn': 
                 mp.set_start_method('spawn', force=True)
-            except RuntimeError as e:
-                logger.warning(f"Could not set start_method to 'spawn': {e}. Using default.")
+            
+            # Pass current_dataset_name to the wrapper
+            func = functools.partial(run_process_wrapper, world_size=world_size, args=args, current_dataset_name_for_wrapper=current_dataset_name)
+            with Pool(world_size) as pool:
+                results_list_of_lists = pool.map(func, range(world_size))
+            current_dataset_summary = [item for sublist in results_list_of_lists for item in sublist if sublist] 
+        else:
+            logger.info(f"Using single process evaluation for dataset {current_dataset_name}.")
+            rank = 0
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            model, tokenizer, processor = load_model_and_processor(args.model_path, device=device)
+            
+            all_sequence_names_for_current_dataset = [seq.name for seq in get_dataset(current_dataset_name)]
+            sequences_to_run = []
+            if args.sequence:
+                if args.sequence in all_sequence_names_for_current_dataset:
+                    sequences_to_run = [args.sequence]
+                else:
+                    logger.warning(f"Sequence '{args.sequence}' not found in dataset '{current_dataset_name}'. Skipping this sequence for this dataset.")
+            else:
+                sequences_to_run = all_sequence_names_for_current_dataset
 
-        with Pool(world_size) as pool:
-            func = functools.partial(run_process_wrapper, world_size=world_size, args=args)
-            results_list_of_lists = pool.map(func, range(world_size))
-        all_results_summary = [item for sublist in results_list_of_lists for item in sublist if sublist] 
-    else:
-        logger.info("Using single process evaluation.")
-        rank = 0
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        model, tokenizer, processor = load_model_and_processor(args.model_path, device=device)
-        all_sequence_names = [seq.name for seq in get_dataset(args.dataset_name)]
-        sequences_to_run = [args.sequence] if args.sequence else all_sequence_names
-        if not sequences_to_run:
-            logger.info("No sequences selected.")
-            return
-        all_results_summary = evaluate_tracking_rft(
-            model, tokenizer, processor, sequences_names=sequences_to_run,
-            dataset_name=args.dataset_name, save_visualize=args.save_vis,
-            output_dir=args.output_dir, max_new_tokens=args.max_new_tokens, rank=rank,
-            smart_resize_min_pixels=args.smart_resize_min_pixels,
-            smart_resize_max_pixels=args.smart_resize_max_pixels,
-            gap_list=args.gap_list
-        )
+            if not sequences_to_run:
+                logger.info(f"No sequences selected to run for dataset {current_dataset_name}.")
+            else:
+                current_dataset_summary = evaluate_tracking_rft(
+                    model, tokenizer, processor, sequences_names=sequences_to_run,
+                    dataset_name=current_dataset_name, save_visualize=args.save_vis,
+                    output_dir=args.output_dir, max_new_tokens=args.max_new_tokens, rank=rank,
+                    smart_resize_min_pixels=args.smart_resize_min_pixels,
+                    smart_resize_max_pixels=args.smart_resize_max_pixels,
+                    gap_list=args.gap_list
+                )
 
-    if all_results_summary: 
-        summary_file = os.path.join(args.output_dir, f"tracking_summary_{args.dataset_name}.json")
+        summary_file = os.path.join(args.output_dir, f"tracking_summary_{current_dataset_name}.json")
         with open(summary_file, "w") as f:
-            json.dump(all_results_summary, f, indent=2)
-        logger.info(f"Overall tracking summary saved to {summary_file}")
-    else:
-        logger.info("No results to summarize.")
+            json.dump(current_dataset_summary, f, indent=2)
+        logger.info(f"Tracking summary for {current_dataset_name} saved to {summary_file}")
+
+        logger.info(f"Proceeding to results analysis for dataset: {current_dataset_name}...")
+        results_path_for_analysis = os.path.join(args.output_dir, current_dataset_name)
+        
+        logger.info(f"Calling evaluate_direct with results_path: {results_path_for_analysis} and dataset_name: {current_dataset_name}")
+        
+        evaluate_direct(results_path_for_analysis, current_dataset_name)
+
 
 if __name__ == "__main__":
     main()

@@ -21,8 +21,8 @@ def evaluate_direct(results_path, dataset_name):
     """直接评估预测结果
     
     Args:
-        results_path: 预测结果txt文件所在的目录
-        dataset_name: 数据集名称
+        results_path: 预测结果txt文件所在的目录 (e.g., output_dir/lasot)
+        dataset_name: 数据集名称 (e.g., lasot)
     """
 
     dataset = get_dataset(dataset_name)
@@ -30,21 +30,20 @@ def evaluate_direct(results_path, dataset_name):
     print(f"sucessfully load dataset: {dataset_name}, total {len(dataset)} sequences")
 
     
-    # 3. 创建一个简单的tracker对象
-    # 注意：extract_results假设results_dir下有dataset_name的子目录
-    # 但你的路径可能已经包含了这个结构，所以我们取最后一级目录作为parameter_name
-    parameter_name = os.path.basename(results_path) if results_path.endswith('/') else os.path.basename(results_path)
-    parent_dir = os.path.dirname(results_path)
+    # parameter_name_for_report 用于报告中的显示，可以保持为数据集名称
+    parameter_name_for_report = os.path.basename(results_path)
+    # tracker_base_results_dir 是包含各数据集结果文件夹的父目录 (e.g., output_dir)
+    tracker_base_results_dir = os.path.dirname(results_path)
     
     tracker = SimpleTracker(
         name='custom_tracker',
-        parameter_name=parameter_name,
+        parameter_name="",  # 设置为空字符串，以避免在路径中创建额外的层级
         run_id=None,
-        results_dir=parent_dir,  # 使用父目录作为results_dir
-        display_name='CustomTracker'
+        results_dir=tracker_base_results_dir,  # 指向包含数据集文件夹的目录
+        display_name=f'CustomTracker_{parameter_name_for_report}' # 或者 'CustomTracker'
     )
     
-    report_name = f"{dataset_name}_{parameter_name}_eval"
+    report_name = f"{dataset_name}_eval" # 或者 f"{parameter_name_for_report}_eval"
     eval_data = extract_results(
         trackers=[tracker], 
         dataset=dataset, 
@@ -81,10 +80,20 @@ def evaluate_direct(results_path, dataset_name):
         print(f"Precision: {prec_score.item():.4f}")
         print(f"Normalized Precision: {norm_prec_score.item():.4f}")
         
-        # 输出保存位置
-        settings = env_settings()
-        result_path = os.path.join(settings.result_plot_path, report_name)
-        print(f"\n results saved in: {result_path}/eval_data.pkl")
+        
+        output_summary_dir = os.path.join(os.path.dirname(results_path), report_name)
+        os.makedirs(output_summary_dir, exist_ok=True) #确保目录存在
+        summary_txt_file_path = os.path.join(output_summary_dir, "evaluation_summary.txt")
+
+        with open(summary_txt_file_path, "w") as f:
+            f.write(f"Dataset Name: {dataset_name}\n")
+            f.write(f"Tracker Parameter Name: {parameter_name_for_report}\n") # 使用 for_report 版本
+            f.write(f"Evaluated Sequences: {valid_sequence.sum().item()} / {len(dataset)}\n")
+            f.write(f"Success (AUC): {auc.item():.4f}\n")
+            f.write(f"Precision: {prec_score.item():.4f}\n")
+            f.write(f"Normalized Precision: {norm_prec_score.item():.4f}\n")
+        
+        print(f"\nEvaluation summary saved to: {summary_txt_file_path}")
 
 
 if __name__ == "__main__":
