@@ -107,7 +107,7 @@ def fix_dir(dir_path):
                 new_file_path = os.path.join(dir_path, new_file_name)
 
                 os.rename(predictions_file_path, new_file_path)
-                print(f"Renamed: {predictions_file_path} to {new_file_path}")
+                # print(f"Renamed: {predictions_file_path} to {new_file_path}")
 
 
 if __name__ == "__main__":
