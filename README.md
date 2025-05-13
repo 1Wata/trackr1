@@ -79,16 +79,12 @@ python make_rft_dataset.py --samples_per_epoch 40000 --output_dir path/to/save/j
 
 ## Step4. 评估：
 
-​在推理之前，需要设置一下推理脚本的路径，先只用 OTB_lang 数据集测试，修改 `dataset_interface/evaluation/local.py` 文件夹下 OTB_lang 数据集路径
+​在推理之前，需要设置一下推理脚本的路径，先只用 OTB_lang 数据集测试，修改 `dataset_interface/evaluation/local.py` 文件夹下 OTB_lang, TNL2k, lasot 数据集路径
 
-​	推理脚本在 dataset_interface 文件夹下，采用了多进程推理，默认使用全部的显卡推理（几张显卡几个进程）（这个由于没有资源跑，我不能完全保证代码没有问题）
+​推理脚本在 dataset_interface 文件夹下，采用了多进程推理，默认使用全部的显卡推理（几张显卡几个进程）
 
-# 首先运行推理脚本
+# 运行推理脚本并进行指标计算
 ```
 cd dataset_interface
-python rft_tracking_inference.py --model_path /path/to/model --dataset_name OTB_lang --output_dir result_dir
-```
-# 然后运行 metric 计算脚本
-```
-python analysis_results.py result_dir/OTB_lang OTB_lang
+python rft_tracking_inference.py --model_path /path/to/model --output_dir result_dir
 ```
